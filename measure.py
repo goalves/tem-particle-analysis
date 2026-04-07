@@ -1,17 +1,19 @@
 """
 TEM nanoparticle size analysis.
 
-Detects large circular particles in TEM images using Cellpose.
+Detects large circular particles (vesicles) in TEM images using Cellpose.
 Measures outer diameter and wall thickness (via radial intensity profile).
 Auto-detects scale bar from image when possible.
 
 Usage:
-    uv run python analise.py images/sample.jpeg
-    uv run python analise.py images/*.jpeg
-    uv run python analise.py images/ --scale-nm 200
+    uv run python measure.py images/sample.jpeg --scale-nm 200
+    uv run python measure.py images/*.jpeg --scale-nm 200
+    uv run python measure.py images/ --scale-nm 200
+    uv run python measure.py images/ --scale-nm 100 --scale-px 150
 """
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,8 +33,6 @@ from skimage import measure
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
-ROI_TOP_FRACTION = 0.72  # crop grid hole at the bottom
-
 CELLPOSE_DIAMETER = 120
 CELLPOSE_CELLPROB = 0.0
 CELLPOSE_FLOW = 0.8
@@ -56,10 +56,8 @@ def detect_scale_bar(img: np.ndarray) -> int | None:
     h, w = img.shape[:2]
     bottom = img[int(h * 0.85) :, :]
 
-    # Threshold to find dark pixels
     _, binary = cv2.threshold(bottom, 20, 255, cv2.THRESH_BINARY_INV)
 
-    # Morphological opening with horizontal kernel to isolate horizontal lines
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
     horiz_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
 
@@ -70,55 +68,91 @@ def detect_scale_bar(img: np.ndarray) -> int | None:
         comp_w = stats[i, cv2.CC_STAT_WIDTH]
         comp_h = stats[i, cv2.CC_STAT_HEIGHT]
 
-        # Scale bar: wide horizontal structure, not too tall
         if comp_w > w * 0.05 and comp_h < h * 0.05 and comp_w > best_width:
             best_width = comp_w
 
     return best_width if best_width > 0 else None
 
 
-def parse_scale_text(img: np.ndarray) -> float | None:
-    """
-    Try to read scale bar text (e.g. '200.0nm') from the bottom of the image.
+_ocr_reader = None
 
-    Uses template matching on common patterns. Returns nm value or None.
+# Pattern to match scale text like "200.0nm", "100nm", "1.5um", "500 nm"
+# Handles common OCR mistakes: O->0, l->1
+_SCALE_PATTERN = re.compile(
+    r"(\d+\.?\d*)\s*(nm|um|μm)",
+    re.IGNORECASE,
+)
+
+
+def _get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+
+        _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _ocr_reader
+
+
+def detect_scale_text(img: np.ndarray) -> float | None:
     """
-    # This is hard to do reliably without OCR.
-    # For now, return None and let the user provide --scale-nm.
+    Read scale bar text (e.g. '200.0nm') from the bottom of the image using OCR.
+
+    Returns the scale value in nm, or None if not found.
+    """
+    h, _w = img.shape[:2]
+    bottom = img[int(h * 0.85) :, :]
+
+    reader = _get_ocr_reader()
+    results = reader.readtext(bottom)
+
+    for _bbox, text, _conf in results:
+        # Fix common OCR mistakes
+        cleaned = text.replace("O", "0").replace("l", "1").replace(",", ".")
+        match = _SCALE_PATTERN.search(cleaned)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2).lower()
+            if unit in ("um", "μm"):
+                value *= 1000  # convert um to nm
+            return value
+
     return None
 
 
-def determine_scale(img: np.ndarray, scale_nm: float | None) -> tuple[float, int | None]:
+def determine_scale(img: np.ndarray, scale_nm: float | None) -> tuple[float | None, int | None]:
     """
     Determine nm/pixel scale. Returns (nm_per_pixel, bar_pixels).
 
-    Priority:
-    1. Auto-detect bar pixels from image + user-provided scale_nm
-    2. User-provided scale_nm + auto-detected bar pixels
-    3. Fall back to user-provided values
+    Strategy:
+    1. Auto-detect bar pixel length from the image
+    2. Use provided scale_nm, or try OCR to read the nm value from the image
+    3. Return (None, ...) if either piece is missing
     """
     bar_px = detect_scale_bar(img)
 
-    if bar_px is not None and scale_nm is not None:
-        nm_per_pixel = scale_nm / bar_px
-        return nm_per_pixel, bar_px
+    # If scale_nm not provided, try OCR
+    if scale_nm is None:
+        ocr_nm = detect_scale_text(img)
+        if ocr_nm is not None:
+            print(f"  OCR detected scale text: {ocr_nm}nm")
+            scale_nm = ocr_nm
 
-    if bar_px is not None and scale_nm is None:
-        print(f"  WARNING: detected scale bar = {bar_px}px but don't know the nm value.")
+    if bar_px is not None and scale_nm is not None:
+        return scale_nm / bar_px, bar_px
+
+    if bar_px is not None:
+        print(f"  WARNING: detected scale bar = {bar_px}px but could not read the nm value.")
         print("  Use --scale-nm to specify (e.g. --scale-nm 200)")
-        print("  Assuming 200nm for now.")
-        nm_per_pixel = 200.0 / bar_px
-        return nm_per_pixel, bar_px
+        return None, bar_px
 
     if scale_nm is not None:
-        print("  WARNING: could not auto-detect scale bar. Using --scale-nm with default bar.")
-        # Fall back to a reasonable default
-        nm_per_pixel = scale_nm / 208
-        return nm_per_pixel, None
+        print("  WARNING: could not auto-detect scale bar pixels.")
+        print("  Use --scale-px to specify, or provide both --scale-nm and --scale-px.")
+        return None, None
 
-    print("  WARNING: no scale info. Use --scale-nm and/or --scale-px.")
-    print("  Assuming 200nm / 208px for now.")
-    return 200.0 / 208, None
+    print("  WARNING: could not detect scale bar or read scale text.")
+    print("  Use --scale-nm and --scale-px to specify manually.")
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -149,30 +183,46 @@ def run_cellpose(roi: np.ndarray) -> np.ndarray:
     return masks
 
 
+def compute_radial_profile(
+    roi: np.ndarray, cy: int, cx: int, max_r: int, n_angles: int = 360
+) -> np.ndarray:
+    """Compute average radial intensity profile using vectorized sampling."""
+    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+    radii = np.arange(max_r)
+
+    # Build (n_angles, max_r) grids of x,y coordinates
+    cos_a = np.cos(angles)[:, np.newaxis]  # (n_angles, 1)
+    sin_a = np.sin(angles)[:, np.newaxis]
+    r = radii[np.newaxis, :]  # (1, max_r)
+
+    xs = (cx + r * cos_a).astype(int)  # (n_angles, max_r)
+    ys = (cy + r * sin_a).astype(int)
+
+    # Mask out-of-bounds coordinates
+    h, w = roi.shape
+    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+
+    # Sample intensities (use 0 for out-of-bounds, then average only valid)
+    xs_safe = np.clip(xs, 0, w - 1)
+    ys_safe = np.clip(ys, 0, h - 1)
+    intensities = roi[ys_safe, xs_safe].astype(np.float64)
+    intensities[~valid] = 0.0
+
+    counts = valid.sum(axis=0).astype(np.float64)
+    profile = np.where(counts > 0, intensities.sum(axis=0) / counts, 0.0)
+    return profile
+
+
 def measure_wall_thickness(
     roi: np.ndarray, cy: int, cx: int, radius_px: float, nm_per_pixel: float
 ) -> dict:
     """
     Measure wall thickness via radial intensity profile.
 
-    Returns dict with wall_px, radii_nm, profile, threshold, inner/outer edges.
+    Returns dict with wall_px, radii_nm, profile, threshold, inner/outer edges, is_vesicle.
     """
-    n_angles = 360
     max_r = int(radius_px * 1.8)
-    profile = np.zeros(max_r)
-    counts = np.zeros(max_r)
-
-    for angle in np.linspace(0, 2 * np.pi, n_angles, endpoint=False):
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        for r in range(max_r):
-            x = int(cx + r * cos_a)
-            y = int(cy + r * sin_a)
-            if 0 <= x < roi.shape[1] and 0 <= y < roi.shape[0]:
-                profile[r] += roi[y, x]
-                counts[r] += 1
-
-    valid = counts > 0
-    profile[valid] /= counts[valid]
+    profile = compute_radial_profile(roi, cy, cx, max_r)
     profile_smooth = uniform_filter1d(profile, size=7)
 
     radii_nm = np.arange(max_r) * nm_per_pixel
@@ -180,7 +230,7 @@ def measure_wall_thickness(
     # Wall = region darker than midpoint between background and darkest point
     bg = np.mean(profile_smooth[max(0, max_r - 30) : max_r])
     darkest = np.min(profile_smooth[5:])
-    threshold = (bg + darkest) / 2
+    threshold = float((bg + darkest) / 2)
 
     below = profile_smooth < threshold
     if not np.any(below):
@@ -203,7 +253,7 @@ def measure_wall_thickness(
     # 1. A brighter center (hollow interior) — center intensity above the threshold
     # 2. Dark wall ring away from center — inner edge not at r=0
     # A solid dark blob has its darkest point at/near the center.
-    center_intensity = np.mean(profile_smooth[: max(5, int(radius_px * 0.3))])
+    center_intensity = float(np.mean(profile_smooth[: max(5, int(radius_px * 0.3))]))
     is_vesicle = center_intensity > threshold and inner_px > int(radius_px * 0.15)
 
     return {
@@ -211,8 +261,8 @@ def measure_wall_thickness(
         "radii_nm": radii_nm,
         "profile": profile_smooth,
         "threshold": threshold,
-        "inner_nm": inner_px * nm_per_pixel,
-        "outer_nm": outer_px * nm_per_pixel,
+        "inner_nm": float(inner_px * nm_per_pixel),
+        "outer_nm": float(outer_px * nm_per_pixel),
         "is_vesicle": is_vesicle,
     }
 
@@ -348,8 +398,30 @@ def save_profiles(df: pd.DataFrame, out_dir: Path, nm_per_pixel: float):
 # ---------------------------------------------------------------------------
 # Single image processing
 # ---------------------------------------------------------------------------
+def make_unique_dir(output_dir: Path, image_path: Path) -> Path:
+    """Create a unique output subdirectory for an image, handling name collisions."""
+    base = image_path.stem
+    candidate = output_dir / base
+    if not candidate.exists():
+        candidate.mkdir(parents=True)
+        return candidate
+    # Append parent directory name to disambiguate
+    parent_name = image_path.parent.name
+    candidate = output_dir / f"{parent_name}_{base}"
+    counter = 0
+    while candidate.exists():
+        counter += 1
+        candidate = output_dir / f"{parent_name}_{base}_{counter}"
+    candidate.mkdir(parents=True)
+    return candidate
+
+
 def process_image(
-    image_path: Path, output_dir: Path, scale_nm: float | None, scale_px: int | None
+    image_path: Path,
+    output_dir: Path,
+    scale_nm: float | None,
+    scale_px: int | None,
+    roi_fraction: float,
 ) -> pd.DataFrame:
     """Process a single TEM image. Returns DataFrame of particle measurements."""
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -359,12 +431,16 @@ def process_image(
 
     # Per-image scale calibration
     if scale_px is not None and scale_nm is not None:
-        # Both provided by user — use as-is
         nm_per_pixel = scale_nm / scale_px
     else:
         nm_per_pixel, _auto_bar_px = determine_scale(img, scale_nm)
 
-    roi_y = int(img.shape[0] * ROI_TOP_FRACTION)
+    if nm_per_pixel is None:
+        print(f"  SKIPPING {image_path.name}: could not determine scale.")
+        print("  Provide --scale-nm and --scale-px, or ensure image has a visible scale bar.")
+        return pd.DataFrame()
+
+    roi_y = int(img.shape[0] * roi_fraction)
     roi = img[:roi_y, :]
 
     # Detect
@@ -389,8 +465,7 @@ def process_image(
         print(f"    #{row['id']} d={row['diam_nm']:.0f}nm{wall_str}")
 
     # Save per-image outputs
-    img_dir = output_dir / image_path.stem
-    img_dir.mkdir(parents=True, exist_ok=True)
+    img_dir = make_unique_dir(output_dir, image_path)
 
     cv2.imwrite(str(img_dir / "roi.png"), roi)
 
@@ -436,7 +511,15 @@ def main():
         help="Image files or directories (default: images/)",
     )
     parser.add_argument("--scale-nm", type=float, default=None, help="Scale bar value in nm")
-    parser.add_argument("--scale-px", type=int, default=None, help="Scale bar length in pixels")
+    parser.add_argument(
+        "--scale-px", type=int, default=None, help="Scale bar length in pixels (skip auto-detect)"
+    )
+    parser.add_argument(
+        "--roi-fraction",
+        type=float,
+        default=0.72,
+        help="Fraction of image height to use as ROI from the top (default: 0.72)",
+    )
     parser.add_argument(
         "--output", type=str, default="output", help="Output directory (default: output)"
     )
@@ -454,6 +537,7 @@ def main():
     print("\n=== TEM particle analysis ===")
     print(f"Images: {len(image_paths)}")
     print(f"Diameter range: {MIN_DIAM_NM}-{MAX_DIAM_NM} nm")
+    print(f"ROI fraction: {args.roi_fraction}")
     if args.scale_nm:
         print(f"Scale bar value: {args.scale_nm} nm")
     if args.scale_px:
@@ -465,7 +549,7 @@ def main():
     print(f"\n--- Processing {len(image_paths)} image(s) ---")
     all_results = []
     for image_path in image_paths:
-        df = process_image(image_path, output_dir, args.scale_nm, args.scale_px)
+        df = process_image(image_path, output_dir, args.scale_nm, args.scale_px, args.roi_fraction)
         if len(df) > 0:
             all_results.append(df)
 
@@ -474,14 +558,21 @@ def main():
         df_all = pd.concat(all_results, ignore_index=True)
         df_all.to_csv(output_dir / "all_particles.csv", index=False)
 
-        print(f"\n--- Summary ({len(df_all)} particles across {len(all_results)} images) ---")
+        n = len(df_all)
+        n_images = len(all_results)
+        print(f"\n--- Summary ({n} particles across {n_images} images) ---")
         d = df_all["diam_nm"]
-        print(f"  Diameter: {d.mean():.1f} +/- {d.std():.1f} nm")
+        if n > 1:
+            print(f"  Diameter: {d.mean():.1f} +/- {d.std():.1f} nm")
+        else:
+            print(f"  Diameter: {d.mean():.1f} nm")
         print(f"  Median:   {d.median():.1f} nm")
         print(f"  Range:    {d.min():.1f} - {d.max():.1f} nm")
         walls = df_all["wall_nm"].dropna()
-        if len(walls) > 0:
+        if len(walls) > 1:
             print(f"  Wall:     {walls.mean():.1f} +/- {walls.std():.1f} nm")
+        elif len(walls) == 1:
+            print(f"  Wall:     {walls.mean():.1f} nm")
 
         print("\n--- Files ---")
         print(f"  {output_dir}/all_particles.csv")

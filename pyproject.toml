@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cellpose>=4.1.1",
+    "easyocr>=1.7.2",
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
     "opencv-python-headless>=4.13.0.92",
