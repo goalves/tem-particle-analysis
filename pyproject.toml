@@ -1,7 +1,7 @@
 [project]
-name = "analise-particula"
+name = "tem-particle-analysis"
 version = "0.1.0"
-description = ""
+description = "Measure vesicle size and wall thickness from TEM images"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
