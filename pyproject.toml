@@ -1,0 +1,26 @@
+[project]
+name = "analise-particula"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cellpose>=4.1.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "opencv-python-headless>=4.13.0.92",
+    "pandas>=3.0.2",
+    "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.9",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
