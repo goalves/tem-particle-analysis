@@ -191,12 +191,20 @@ def measure_wall_thickness(
             "threshold": threshold,
             "inner_nm": None,
             "outer_nm": None,
+            "is_vesicle": False,
         }
 
     indices = np.where(below)[0]
     inner_px = indices[0]
     outer_px = indices[-1]
     wall_px = float(outer_px - inner_px)
+
+    # Vesicle validation: a real vesicle (donut) has:
+    # 1. A brighter center (hollow interior) — center intensity above the threshold
+    # 2. Dark wall ring away from center — inner edge not at r=0
+    # A solid dark blob has its darkest point at/near the center.
+    center_intensity = np.mean(profile_smooth[: max(5, int(radius_px * 0.3))])
+    is_vesicle = center_intensity > threshold and inner_px > int(radius_px * 0.15)
 
     return {
         "wall_px": wall_px,
@@ -205,6 +213,7 @@ def measure_wall_thickness(
         "threshold": threshold,
         "inner_nm": inner_px * nm_per_pixel,
         "outer_nm": outer_px * nm_per_pixel,
+        "is_vesicle": is_vesicle,
     }
 
 
@@ -223,6 +232,10 @@ def measure_particles(roi: np.ndarray, masks: np.ndarray, nm_per_pixel: float) -
         radius_px = np.sqrt(p.area / np.pi)
 
         wall_info = measure_wall_thickness(roi, cy, cx, radius_px, nm_per_pixel)
+
+        if not wall_info["is_vesicle"]:
+            continue
+
         wall_nm = wall_info["wall_px"] * nm_per_pixel if wall_info["wall_px"] is not None else None
 
         rows.append(
@@ -336,13 +349,20 @@ def save_profiles(df: pd.DataFrame, out_dir: Path, nm_per_pixel: float):
 # Single image processing
 # ---------------------------------------------------------------------------
 def process_image(
-    image_path: Path, output_dir: Path, nm_per_pixel: float, scale_bar_px: int | None
+    image_path: Path, output_dir: Path, scale_nm: float | None, scale_px: int | None
 ) -> pd.DataFrame:
     """Process a single TEM image. Returns DataFrame of particle measurements."""
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         print(f"  ERROR: could not load {image_path}")
         return pd.DataFrame()
+
+    # Per-image scale calibration
+    if scale_px is not None and scale_nm is not None:
+        # Both provided by user — use as-is
+        nm_per_pixel = scale_nm / scale_px
+    else:
+        nm_per_pixel, _auto_bar_px = determine_scale(img, scale_nm)
 
     roi_y = int(img.shape[0] * ROI_TOP_FRACTION)
     roi = img[:roi_y, :]
@@ -355,7 +375,10 @@ def process_image(
 
     # Measure
     df = measure_particles(roi, masks, nm_per_pixel)
-    print(f"  {image_path.name}: {len(df)} particles ({raw_count} raw) [{elapsed:.1f}s]")
+    print(
+        f"  {image_path.name}: {len(df)} particles ({raw_count} raw)"
+        f" [{elapsed:.1f}s] scale={nm_per_pixel:.3f} nm/px"
+    )
 
     if len(df) == 0:
         return pd.DataFrame()
@@ -379,9 +402,10 @@ def process_image(
     export_cols = [c for c in df.columns if not c.startswith("_")]
     df[export_cols].to_csv(img_dir / "particles.csv", index=False)
 
-    # Add source image column for aggregate
+    # Add source image and scale columns for aggregate
     df_export = df[export_cols].copy()
     df_export.insert(0, "image", image_path.name)
+    df_export["nm_per_pixel"] = round(nm_per_pixel, 4)
     return df_export
 
 
@@ -429,34 +453,19 @@ def main():
 
     print("\n=== TEM particle analysis ===")
     print(f"Images: {len(image_paths)}")
+    print(f"Diameter range: {MIN_DIAM_NM}-{MAX_DIAM_NM} nm")
+    if args.scale_nm:
+        print(f"Scale bar value: {args.scale_nm} nm")
+    if args.scale_px:
+        print(f"Scale bar pixels: {args.scale_px} px")
+    if not args.scale_nm and not args.scale_px:
+        print("Scale: auto-detect per image (provide --scale-nm for accuracy)")
 
-    # Determine scale from first image
-    print("\n--- Scale calibration ---")
-    first_img = cv2.imread(str(image_paths[0]), cv2.IMREAD_GRAYSCALE)
-    if first_img is None:
-        print(f"ERROR: could not load {image_paths[0]}")
-        sys.exit(1)
-
-    if args.scale_px is not None and args.scale_nm is not None:
-        nm_per_pixel = args.scale_nm / args.scale_px
-        bar_px = args.scale_px
-        print(f"  Scale (from args): {bar_px}px = {args.scale_nm}nm -> {nm_per_pixel:.3f} nm/px")
-    else:
-        nm_per_pixel, bar_px = determine_scale(first_img, args.scale_nm)
-        if bar_px is not None:
-            print(f"  Scale bar detected: {bar_px}px -> {nm_per_pixel:.3f} nm/px")
-        else:
-            print(f"  Scale: {nm_per_pixel:.3f} nm/px (default/assumed)")
-
-    print(f"  Diameter range: {MIN_DIAM_NM}-{MAX_DIAM_NM} nm")
-    cp_nm = CELLPOSE_DIAMETER * nm_per_pixel
-    print(f"  Cellpose diameter: {CELLPOSE_DIAMETER} px ({cp_nm:.0f} nm)")
-
-    # Process each image
+    # Process each image (scale detected per-image)
     print(f"\n--- Processing {len(image_paths)} image(s) ---")
     all_results = []
     for image_path in image_paths:
-        df = process_image(image_path, output_dir, nm_per_pixel, bar_px)
+        df = process_image(image_path, output_dir, args.scale_nm, args.scale_px)
         if len(df) > 0:
             all_results.append(df)
 
