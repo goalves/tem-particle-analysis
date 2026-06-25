@@ -16,6 +16,7 @@ import argparse
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -33,28 +34,75 @@ from skimage import measure
 # ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
-CELLPOSE_DIAMETER = 120
 CELLPOSE_CELLPROB = 0.0
 CELLPOSE_FLOW = 0.8
 
-MIN_DIAM_NM = 80
-MAX_DIAM_NM = 500
+# Reject elongated/non-circular detections (lines, debris, image edges).
+# 1.0 is a perfect circle; vesicles are typically > 0.7.
+MIN_CIRCULARITY = 0.5
+
+# Reject detections whose bounding box reaches into a margin near any image
+# edge — these are almost always artifacts from where the image meets a
+# label strip, dark border, or grid bar. Expressed as a fraction of the
+# smaller image dimension (~40 px on a 2048² image).
+EDGE_MARGIN_FRAC = 0.02
+
+# Real TEM particles are markedly darker than their immediate surroundings
+# (heavy-metal staining + projection density). Reject detections where the
+# mean intensity inside the mask isn't at least this many uint8 units below
+# the mean intensity of an annular ring around it.
+MIN_CONTRAST = 10.0
+
+# Physical sanity check: the technician picks the magnification to match the
+# particle size, so real particles cluster within ~0.5-3x the scale bar.
+# Anything an order of magnitude smaller (grain, stain artifact) or larger
+# (image features that aren't single particles) is rejected.
+MIN_DIAM_VS_BAR = 0.4
+MAX_DIAM_VS_BAR = 4.0
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def normalize_intensity(img: np.ndarray) -> np.ndarray:
+    """
+    Stretch intensity to [0, 255] using 1st/99th percentile clipping.
+
+    Some TIF acquisitions store data with a tiny dynamic range (e.g. 17-26
+    out of 0-255); without this stretch, both OCR and Cellpose see a uniform
+    gray and find nothing. Percentile clipping (vs. plain min/max) keeps
+    bright outliers like the scale bar from compressing the bulk image.
+    """
+    p1, p99 = np.percentile(img, [1, 99])
+    if p99 - p1 < 1:
+        return img
+    stretched = (img.astype(np.float32) - p1) * (255.0 / (p99 - p1))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
 # Scale bar detection
 # ---------------------------------------------------------------------------
-def detect_scale_bar(img: np.ndarray) -> int | None:
+@dataclass
+class ScaleBarLocation:
+    """Pixel coordinates of a scale bar in the original (full) image."""
+
+    width_px: int
+    x_left: int
+    x_right: int
+    y_top: int
+    y_bottom: int
+
+
+def detect_scale_bar(img: np.ndarray) -> ScaleBarLocation | None:
     """
-    Auto-detect scale bar length in pixels from the bottom of a TEM image.
+    Auto-detect scale bar in the bottom of a TEM image.
 
     Uses morphological filtering to find horizontal line structures.
-    Returns the bar length in pixels, or None if not found.
+    Returns location (in full-image coordinates) or None if not found.
     """
     h, w = img.shape[:2]
-    bottom = img[int(h * 0.85) :, :]
+    strip_y0 = int(h * 0.85)
+    bottom = img[strip_y0:, :]
 
     _, binary = cv2.threshold(bottom, 20, 255, cv2.THRESH_BINARY_INV)
 
@@ -63,15 +111,25 @@ def detect_scale_bar(img: np.ndarray) -> int | None:
 
     n_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(horiz_lines)
 
-    best_width = 0
+    best = None
     for i in range(1, n_labels):
-        comp_w = stats[i, cv2.CC_STAT_WIDTH]
-        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+        comp_w = int(stats[i, cv2.CC_STAT_WIDTH])
+        comp_h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if comp_w <= w * 0.05 or comp_h >= h * 0.05:
+            continue
+        if best is not None and comp_w <= best.width_px:
+            continue
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        best = ScaleBarLocation(
+            width_px=comp_w,
+            x_left=x,
+            x_right=x + comp_w,
+            y_top=strip_y0 + y,
+            y_bottom=strip_y0 + y + comp_h,
+        )
 
-        if comp_w > w * 0.05 and comp_h < h * 0.05 and comp_w > best_width:
-            best_width = comp_w
-
-    return best_width if best_width > 0 else None
+    return best
 
 
 _ocr_reader = None
@@ -89,70 +147,222 @@ def _get_ocr_reader():
     if _ocr_reader is None:
         import easyocr
 
-        _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        # Try MPS first (Apple Silicon); fall back to CPU if EasyOCR's
+        # device selection can't handle it on this version/platform.
+        try:
+            _ocr_reader = easyocr.Reader(["en"], gpu="mps", verbose=False)
+        except (ValueError, RuntimeError, AssertionError):
+            _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _ocr_reader
 
 
-def detect_scale_text(img: np.ndarray) -> float | None:
+_MIN_OCR_CONFIDENCE = 0.2
+
+# TEM scale bars are always one of these (n*10^k for n in {1,2,5}).
+# OCR readings are snapped to the nearest within ±15%; anything else is junk.
+_STANDARD_SCALES_NM = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+_SCALE_SNAP_TOLERANCE = 0.15
+
+
+def _snap_to_standard_scale(value: float) -> float | None:
+    """Return the nearest standard scale bar value if within tolerance, else None."""
+    for standard in _STANDARD_SCALES_NM:
+        if abs(value - standard) / standard <= _SCALE_SNAP_TOLERANCE:
+            return float(standard)
+    return None
+
+
+# If any single read crosses this confidence, accept its value immediately
+# and skip the remaining (slower) OCR strategies.
+_OCR_HIGH_CONFIDENCE = 0.7
+
+
+def _ocr_one(strip: np.ndarray) -> dict[float, float]:
+    """Run OCR on a single preprocessed strip; return {snapped_nm: cumulative_confidence}."""
+    reader = _get_ocr_reader()
+    upscaled = cv2.resize(
+        strip, (strip.shape[1] * 2, strip.shape[0] * 2), interpolation=cv2.INTER_CUBIC
+    )
+    out: dict[float, float] = {}
+    for _bbox, text, conf in reader.readtext(upscaled):
+        if conf < _MIN_OCR_CONFIDENCE:
+            continue
+        # Fix common OCR mistakes: O->0, l->1, , -> .
+        # Also collapse digit-space-digit (e.g. "100 0nm") into "100.0nm"
+        # since the decimal point is often misread as whitespace.
+        cleaned = text.replace("O", "0").replace("l", "1").replace(",", ".")
+        cleaned = re.sub(r"(\d)\s+(\d)", r"\1.\2", cleaned)
+        match = _SCALE_PATTERN.search(cleaned)
+        if not match:
+            continue
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        if unit in ("um", "μm"):
+            value *= 1000
+        snapped = _snap_to_standard_scale(value)
+        if snapped is None:
+            continue
+        out[snapped] = out.get(snapped, 0.0) + conf
+    return out
+
+
+def _ocr_strategies(img: np.ndarray, bar: ScaleBarLocation | None) -> list[np.ndarray]:
+    """
+    Yield preprocessed strips to try in order, cheapest-likely-to-work first.
+
+    Most images succeed on the first (bright-thresholded bottom strip);
+    the rest are escalated through Otsu, normalization, and — if the bar
+    location is known — a tight crop next to the bar.
+    """
+    h, w = img.shape[:2]
+    bottom = img[int(h * 0.85) :, :]
+    bottom_right = img[int(h * 0.85) :, int(w * 0.4) :]
+
+    strategies: list[np.ndarray] = []
+    # Cheap fast path: bright white text on dark background
+    _, fixed = cv2.threshold(bottom, 200, 255, cv2.THRESH_BINARY)
+    strategies.append(fixed)
+    # Tight crop next to the detected bar — usually cleanest input
+    if bar is not None:
+        bar_h = max(bar.y_bottom - bar.y_top, 8)
+        y0 = max(0, bar.y_top - bar_h * 6)
+        y1 = min(h, bar.y_bottom + bar_h * 6)
+        x0 = max(0, bar.x_right - bar.width_px // 4)
+        x1 = min(w, bar.x_right + bar.width_px * 2)
+        if y1 > y0 and x1 > x0:
+            tight = img[y0:y1, x0:x1]
+            strategies.append(normalize_intensity(tight))
+            _, tight_otsu = cv2.threshold(tight, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            strategies.append(tight_otsu)
+    # Adaptive: Otsu on bottom-right (good for mid-gray-on-mid-gray text)
+    _, otsu = cv2.threshold(bottom_right, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    strategies.append(otsu)
+    strategies.append(cv2.bitwise_not(otsu))
+    # Last resort: normalized bottom (helps low-dynamic-range tifs)
+    strategies.append(normalize_intensity(bottom))
+    return strategies
+
+
+def detect_scale_text(img: np.ndarray, bar: ScaleBarLocation | None = None) -> float | None:
     """
     Read scale bar text (e.g. '200.0nm') from the bottom of the image using OCR.
 
     Returns the scale value in nm, or None if not found.
+
+    Strategies are tried in order from cheapest-likely-to-work to slowest;
+    accumulated candidates are kept across attempts and OCR stops as soon
+    as a confident standard-value read appears. Parsed values are snapped
+    to the nearest standard TEM scale (1, 2, 5, ..., 5000 nm); garbled
+    reads like "350nm" or "7100nm" are discarded.
     """
-    h, _w = img.shape[:2]
-    bottom = img[int(h * 0.85) :, :]
+    candidates: dict[float, float] = {}
+    for strip in _ocr_strategies(img, bar):
+        for k, v in _ocr_one(strip).items():
+            candidates[k] = candidates.get(k, 0.0) + v
+        if candidates:
+            best, best_conf = max(candidates.items(), key=lambda kv: kv[1])
+            if best_conf >= _OCR_HIGH_CONFIDENCE:
+                return best
 
-    reader = _get_ocr_reader()
-    results = reader.readtext(bottom)
-
-    for _bbox, text, _conf in results:
-        # Fix common OCR mistakes
-        cleaned = text.replace("O", "0").replace("l", "1").replace(",", ".")
-        match = _SCALE_PATTERN.search(cleaned)
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2).lower()
-            if unit in ("um", "μm"):
-                value *= 1000  # convert um to nm
-            return value
-
-    return None
+    if not candidates:
+        return None
+    return max(candidates, key=candidates.get)
 
 
-def determine_scale(img: np.ndarray, scale_nm: float | None) -> tuple[float | None, int | None]:
+def determine_scale(
+    img: np.ndarray, scale_nm: float | None
+) -> tuple[float | None, int | None, float | None]:
     """
-    Determine nm/pixel scale. Returns (nm_per_pixel, bar_pixels).
+    Determine nm/pixel scale. Returns (nm_per_pixel, bar_pixels, scale_nm).
 
     Strategy:
     1. Auto-detect bar pixel length from the image
     2. Use provided scale_nm, or try OCR to read the nm value from the image
+       (passing bar location for a tight crop next to the bar)
     3. Return (None, ...) if either piece is missing
     """
-    bar_px = detect_scale_bar(img)
+    bar = detect_scale_bar(img)
+    bar_px = bar.width_px if bar is not None else None
 
     # If scale_nm not provided, try OCR
     if scale_nm is None:
-        ocr_nm = detect_scale_text(img)
+        ocr_nm = detect_scale_text(img, bar)
         if ocr_nm is not None:
             print(f"  OCR detected scale text: {ocr_nm}nm")
             scale_nm = ocr_nm
 
     if bar_px is not None and scale_nm is not None:
-        return scale_nm / bar_px, bar_px
+        return scale_nm / bar_px, bar_px, scale_nm
 
     if bar_px is not None:
         print(f"  WARNING: detected scale bar = {bar_px}px but could not read the nm value.")
         print("  Use --scale-nm to specify (e.g. --scale-nm 200)")
-        return None, bar_px
+        return None, bar_px, None
 
     if scale_nm is not None:
         print("  WARNING: could not auto-detect scale bar pixels.")
         print("  Use --scale-px to specify, or provide both --scale-nm and --scale-px.")
-        return None, None
+        return None, None, scale_nm
 
     print("  WARNING: could not detect scale bar or read scale text.")
     print("  Use --scale-nm and --scale-px to specify manually.")
-    return None, None
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# TIFF metadata scale extraction
+# ---------------------------------------------------------------------------
+# JEOL TemReporter XML (embedded in ImageDescription) stores the on-image
+# scale bar value explicitly in these two tags — no OCR required.
+_JEOL_MICRONBAR_VALUE = re.compile(r"<MicronbarValue>([^<]+)</MicronbarValue>")
+_JEOL_MICRONBAR_UNIT = re.compile(r"<MicronbarMeasureUint>([^<]+)</MicronbarMeasureUint>")
+
+_UNIT_TO_NM = {
+    "nanometer": 1.0,
+    "nm": 1.0,
+    "micrometer": 1000.0,
+    "micrometers": 1000.0,
+    "micron": 1000.0,
+    "um": 1000.0,
+    "μm": 1000.0,
+    "millimeter": 1_000_000.0,
+    "mm": 1_000_000.0,
+}
+
+
+def read_tiff_scale_nm(path: Path) -> float | None:
+    """
+    Extract the on-image scale bar value (in nm) from TIFF metadata, if present.
+
+    Currently understands JEOL TemReporter XML (used by JEM-1400 and similar);
+    returns None for other TIFF flavors and non-TIFF files. Far more reliable
+    than OCR when the metadata is available.
+    """
+    if path.suffix.lower() not in (".tif", ".tiff"):
+        return None
+    try:
+        import tifffile
+
+        with tifffile.TiffFile(path) as t:
+            desc_tag = t.pages[0].tags.get("ImageDescription")
+            if desc_tag is None:
+                return None
+            desc = str(desc_tag.value)
+    except (OSError, ValueError, KeyError):
+        return None
+
+    m_val = _JEOL_MICRONBAR_VALUE.search(desc)
+    m_unit = _JEOL_MICRONBAR_UNIT.search(desc)
+    if not m_val or not m_unit:
+        return None
+    try:
+        value = float(m_val.group(1))
+    except ValueError:
+        return None
+    factor = _UNIT_TO_NM.get(m_unit.group(1).strip().lower())
+    if factor is None or value <= 0:
+        return None
+    return value * factor
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +381,18 @@ def get_cellpose_model() -> CellposeModel:
     return _cellpose_model
 
 
-def run_cellpose(roi: np.ndarray) -> np.ndarray:
+def run_cellpose(roi: np.ndarray, diameter_px: float) -> np.ndarray:
+    """
+    Cellpose with an explicit diameter hint (the scale-bar pixel length).
+
+    Auto-sizing (diameter=None) was tried but in TEM images it estimates
+    much too small — segmenting noise and missing real particles — and
+    runs ~15x slower because the model does a pre-pass to estimate size.
+    """
     model = get_cellpose_model()
     masks, _, _ = model.eval(
         roi,
-        diameter=CELLPOSE_DIAMETER,
+        diameter=diameter_px,
         channels=[0, 0],
         flow_threshold=CELLPOSE_FLOW,
         cellprob_threshold=CELLPOSE_CELLPROB,
@@ -267,24 +484,72 @@ def measure_wall_thickness(
     }
 
 
-def measure_particles(roi: np.ndarray, masks: np.ndarray, nm_per_pixel: float) -> pd.DataFrame:
+def _is_near_edge(bbox: tuple[int, int, int, int], shape: tuple[int, int]) -> bool:
+    """True if a region's bounding box reaches into the EDGE_MARGIN_FRAC margin."""
+    h, w = shape
+    margin = int(min(h, w) * EDGE_MARGIN_FRAC)
+    min_row, min_col, max_row, max_col = bbox
+    return (
+        min_row < margin
+        or min_col < margin
+        or max_row > h - margin
+        or max_col > w - margin
+    )
+
+
+def _contrast_vs_ring(roi: np.ndarray, mask: np.ndarray, radius_px: float) -> float:
+    """
+    Mean intensity in a ring just outside the mask minus mean intensity inside it.
+
+    Positive values mean the detection is darker than its surroundings (real
+    particle); ~0 means the detection blends with background (noise/artifact).
+    Ring width scales with particle size so it samples a representative
+    background patch and not random distant pixels.
+    """
+    ring_width = max(3, int(radius_px * 0.5))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1)
+    )
+    dilated = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
+    ring = dilated & ~mask
+    if not ring.any() or not mask.any():
+        return 0.0
+    return float(roi[ring].mean() - roi[mask].mean())
+
+
+def measure_particles(
+    roi: np.ndarray,
+    masks: np.ndarray,
+    nm_per_pixel: float,
+    bar_nm: float,
+) -> pd.DataFrame:
+    min_diam_nm = MIN_DIAM_VS_BAR * bar_nm
+    max_diam_nm = MAX_DIAM_VS_BAR * bar_nm
+
     props = measure.regionprops(masks)
     rows = []
     for p in props:
-        area_nm2 = p.area * nm_per_pixel**2
-        diam_nm = 2 * np.sqrt(area_nm2 / np.pi)
-
-        if diam_nm < MIN_DIAM_NM or diam_nm > MAX_DIAM_NM:
+        if _is_near_edge(p.bbox, roi.shape):
             continue
 
         circ = (4 * np.pi * p.area) / (p.perimeter**2) if p.perimeter > 0 else 0
-        cy, cx = int(p.centroid[0]), int(p.centroid[1])
+        if circ < MIN_CIRCULARITY:
+            continue
+
+        area_nm2 = p.area * nm_per_pixel**2
+        diam_nm = 2 * np.sqrt(area_nm2 / np.pi)
+        if diam_nm < min_diam_nm or diam_nm > max_diam_nm:
+            continue
+
         radius_px = np.sqrt(p.area / np.pi)
+        mask_i = masks == p.label
+        contrast = _contrast_vs_ring(roi, mask_i, radius_px)
+        if contrast < MIN_CONTRAST:
+            continue
+
+        cy, cx = int(p.centroid[0]), int(p.centroid[1])
 
         wall_info = measure_wall_thickness(roi, cy, cx, radius_px, nm_per_pixel)
-
-        if not wall_info["is_vesicle"]:
-            continue
 
         wall_nm = wall_info["wall_px"] * nm_per_pixel if wall_info["wall_px"] is not None else None
 
@@ -297,6 +562,7 @@ def measure_particles(roi: np.ndarray, masks: np.ndarray, nm_per_pixel: float) -
                 "diam_nm": round(diam_nm, 1),
                 "wall_nm": round(wall_nm, 1) if wall_nm is not None else None,
                 "circularity": round(circ, 3),
+                "is_vesicle": wall_info["is_vesicle"],
                 "_wall_info": wall_info,
             }
         )
@@ -306,7 +572,7 @@ def measure_particles(roi: np.ndarray, masks: np.ndarray, nm_per_pixel: float) -
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
-def draw_scale_bar(vis: np.ndarray, nm_per_pixel: float, length_nm: float = 200.0):
+def draw_scale_bar(vis: np.ndarray, nm_per_pixel: float, length_nm: float):
     """Draw a reference scale bar on the image for visual verification."""
     bar_px = int(length_nm / nm_per_pixel)
     margin = 20
@@ -329,7 +595,11 @@ def draw_scale_bar(vis: np.ndarray, nm_per_pixel: float, length_nm: float = 200.
 
 
 def draw_detections(
-    roi: np.ndarray, masks: np.ndarray, df: pd.DataFrame, nm_per_pixel: float
+    roi: np.ndarray,
+    masks: np.ndarray,
+    df: pd.DataFrame,
+    nm_per_pixel: float,
+    scale_bar_nm: float,
 ) -> np.ndarray:
     vis = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
     for _, row in df.iterrows():
@@ -349,7 +619,7 @@ def draw_detections(
             label += f" w={row['wall_nm']:.0f}nm"
         cv2.putText(vis, label, (cx + r + 5, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-    draw_scale_bar(vis, nm_per_pixel)
+    draw_scale_bar(vis, nm_per_pixel, scale_bar_nm)
     return vis
 
 
@@ -398,20 +668,15 @@ def save_profiles(df: pd.DataFrame, out_dir: Path, nm_per_pixel: float):
 # ---------------------------------------------------------------------------
 # Single image processing
 # ---------------------------------------------------------------------------
-def make_unique_dir(output_dir: Path, image_path: Path) -> Path:
+def make_unique_dir(output_dir: Path, image_path: Path, subfolder: str | None = None) -> Path:
     """Create a unique output subdirectory for an image, handling name collisions."""
     base = image_path.stem
-    candidate = output_dir / base
-    if not candidate.exists():
-        candidate.mkdir(parents=True)
-        return candidate
-    # Append parent directory name to disambiguate
-    parent_name = image_path.parent.name
-    candidate = output_dir / f"{parent_name}_{base}"
+    parent = output_dir / subfolder if subfolder else output_dir
+    candidate = parent / base
     counter = 0
     while candidate.exists():
         counter += 1
-        candidate = output_dir / f"{parent_name}_{base}_{counter}"
+        candidate = parent / f"{base}_{counter}"
     candidate.mkdir(parents=True)
     return candidate
 
@@ -421,7 +686,8 @@ def process_image(
     output_dir: Path,
     scale_nm: float | None,
     scale_px: int | None,
-    roi_fraction: float,
+    image_label: str,
+    subfolder: str | None,
 ) -> pd.DataFrame:
     """Process a single TEM image. Returns DataFrame of particle measurements."""
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -432,28 +698,39 @@ def process_image(
     # Per-image scale calibration
     if scale_px is not None and scale_nm is not None:
         nm_per_pixel = scale_nm / scale_px
+        bar_px = scale_px
+        bar_nm: float | None = scale_nm
     else:
-        nm_per_pixel, _auto_bar_px = determine_scale(img, scale_nm)
+        # If CLI didn't override and the file is a TIFF with embedded scale
+        # metadata, prefer that over OCR — it's deterministic and exact.
+        if scale_nm is None:
+            tiff_nm = read_tiff_scale_nm(image_path)
+            if tiff_nm is not None:
+                print(f"  TIFF metadata scale: {tiff_nm}nm")
+                scale_nm = tiff_nm
+        nm_per_pixel, bar_px, bar_nm = determine_scale(img, scale_nm)
 
-    if nm_per_pixel is None:
-        print(f"  SKIPPING {image_path.name}: could not determine scale.")
+    if nm_per_pixel is None or bar_px is None or bar_nm is None or bar_nm <= 0 or bar_px <= 0:
+        print(f"  SKIPPING {image_label}: could not determine scale.")
         print("  Provide --scale-nm and --scale-px, or ensure image has a visible scale bar.")
         return pd.DataFrame()
 
-    roi_y = int(img.shape[0] * roi_fraction)
-    roi = img[:roi_y, :]
+    # The scale bar's pixel length is Cellpose's diameter hint (the model
+    # rescales internally to find features at that scale). We no longer
+    # impose a min/max diameter filter on the output — every Cellpose
+    # detection is accepted subject to shape, edge, and contrast checks.
+    diameter_px = float(bar_px)
 
-    # Detect
     t0 = time.time()
-    masks = run_cellpose(roi)
+    masks = run_cellpose(img, diameter_px)
     elapsed = time.time() - t0
     raw_count = masks.max()
 
-    # Measure
-    df = measure_particles(roi, masks, nm_per_pixel)
+    df = measure_particles(img, masks, nm_per_pixel, bar_nm)
     print(
-        f"  {image_path.name}: {len(df)} particles ({raw_count} raw)"
+        f"  {image_label}: {len(df)} particles ({raw_count} raw)"
         f" [{elapsed:.1f}s] scale={nm_per_pixel:.3f} nm/px"
+        f" bar={bar_nm:.0f}nm/{bar_px}px"
     )
 
     if len(df) == 0:
@@ -462,14 +739,15 @@ def process_image(
     # Print per-image results
     for _, row in df.iterrows():
         wall_str = f" w={row['wall_nm']:.0f}nm" if pd.notna(row.get("wall_nm")) else ""
-        print(f"    #{row['id']} d={row['diam_nm']:.0f}nm{wall_str}")
+        ves_str = "" if row["is_vesicle"] else " [solid]"
+        print(f"    #{row['id']} d={row['diam_nm']:.0f}nm{wall_str}{ves_str}")
 
     # Save per-image outputs
-    img_dir = make_unique_dir(output_dir, image_path)
+    img_dir = make_unique_dir(output_dir, image_path, subfolder)
 
-    cv2.imwrite(str(img_dir / "roi.png"), roi)
+    cv2.imwrite(str(img_dir / "roi.png"), img)
 
-    vis = draw_detections(roi, masks, df, nm_per_pixel)
+    vis = draw_detections(img, masks, df, nm_per_pixel, bar_nm)
     cv2.imwrite(str(img_dir / "detections.png"), vis)
 
     save_profiles(df, img_dir, nm_per_pixel)
@@ -479,27 +757,59 @@ def process_image(
 
     # Add source image and scale columns for aggregate
     df_export = df[export_cols].copy()
-    df_export.insert(0, "image", image_path.name)
+    df_export.insert(0, "image", image_label)
     df_export["nm_per_pixel"] = round(nm_per_pixel, 4)
+    df_export["scale_bar_nm"] = bar_nm
     return df_export
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def collect_images(paths: list[str]) -> list[Path]:
-    """Resolve CLI paths into a list of image files."""
-    images = []
+def collect_images(paths: list[str]) -> list[tuple[Path, Path]]:
+    """
+    Resolve CLI paths into (image_path, root_dir) tuples.
+
+    root_dir is the user-given directory the image was discovered under (or the
+    image's parent if a file was passed directly); used to derive the output
+    subfolder so multi-folder batches stay organized.
+    """
+    images: list[tuple[Path, Path]] = []
     for p in paths:
         path = Path(p)
         if path.is_dir():
-            for ext in IMAGE_EXTENSIONS:
-                images.extend(sorted(path.glob(f"*{ext}")))
+            found = sorted(
+                f for f in path.rglob("*") if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+            )
+            images.extend((f, path) for f in found)
         elif path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-            images.append(path)
+            images.append((path, path.parent))
         else:
             print(f"  Skipping: {path}")
     return images
+
+
+def derive_labels(image_path: Path, root_dir: Path) -> tuple[str, str | None]:
+    """
+    Compute (image_label, output_subfolder) for an image.
+
+    - image_label: human-readable identifier used in CSVs and logs. Includes
+      the relative path under root_dir so multi-folder batches stay distinct.
+    - output_subfolder: subdirectory under output/ that mirrors the input's
+      folder name(s). None when the image is at root_dir's top level.
+    """
+    try:
+        rel = image_path.relative_to(root_dir)
+    except ValueError:
+        return image_path.name, None
+    if rel.parent == Path("."):
+        # Image is at the top level of the passed directory. Use the
+        # directory's own name as the subfolder when meaningful.
+        if root_dir.name and root_dir.name != "images":
+            return f"{root_dir.name}/{image_path.name}", root_dir.name
+        return image_path.name, None
+    sub = f"{root_dir.name}/{rel.parent}" if root_dir.name != "images" else str(rel.parent)
+    return f"{sub}/{image_path.name}", sub
 
 
 def main():
@@ -515,12 +825,6 @@ def main():
         "--scale-px", type=int, default=None, help="Scale bar length in pixels (skip auto-detect)"
     )
     parser.add_argument(
-        "--roi-fraction",
-        type=float,
-        default=0.72,
-        help="Fraction of image height to use as ROI from the top (default: 0.72)",
-    )
-    parser.add_argument(
         "--output", type=str, default="output", help="Output directory (default: output)"
     )
     args = parser.parse_args()
@@ -529,15 +833,13 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # Collect images
-    image_paths = collect_images(args.images)
-    if not image_paths:
+    image_entries = collect_images(args.images)
+    if not image_entries:
         print("No images found.")
         sys.exit(1)
 
     print("\n=== TEM particle analysis ===")
-    print(f"Images: {len(image_paths)}")
-    print(f"Diameter range: {MIN_DIAM_NM}-{MAX_DIAM_NM} nm")
-    print(f"ROI fraction: {args.roi_fraction}")
+    print(f"Images: {len(image_entries)}")
     if args.scale_nm:
         print(f"Scale bar value: {args.scale_nm} nm")
     if args.scale_px:
@@ -546,10 +848,13 @@ def main():
         print("Scale: auto-detect per image (provide --scale-nm for accuracy)")
 
     # Process each image (scale detected per-image)
-    print(f"\n--- Processing {len(image_paths)} image(s) ---")
+    print(f"\n--- Processing {len(image_entries)} image(s) ---")
     all_results = []
-    for image_path in image_paths:
-        df = process_image(image_path, output_dir, args.scale_nm, args.scale_px, args.roi_fraction)
+    for image_path, root_dir in image_entries:
+        image_label, subfolder = derive_labels(image_path, root_dir)
+        df = process_image(
+            image_path, output_dir, args.scale_nm, args.scale_px, image_label, subfolder
+        )
         if len(df) > 0:
             all_results.append(df)
 

@@ -8,9 +8,9 @@ run *ARGS:
 analyze IMAGE:
     uv run python measure.py {{ IMAGE }}
 
-# Run on all images in a directory with known scale
-batch DIR SCALE_NM="200":
-    uv run python measure.py {{ DIR }} --scale-nm {{ SCALE_NM }}
+# Run on all images in a directory (scale auto-detected per image)
+batch DIR:
+    uv run python measure.py {{ DIR }}
 
 # Format code
 fmt:
