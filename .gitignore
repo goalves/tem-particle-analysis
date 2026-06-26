@@ -14,3 +14,6 @@ wheels/
 
 # Output
 output/
+output_annotated/
+output_test/
+output_rt/

@@ -12,6 +12,10 @@ analyze IMAGE:
 batch DIR:
     uv run python measure.py {{ DIR }}
 
+# Interactively annotate one image: click each particle, SAM segments it
+annotate IMAGE:
+    uv run --group annotate python annotate.py "{{ IMAGE }}"
+
 # Format code
 fmt:
     uv run ruff format measure.py

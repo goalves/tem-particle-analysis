@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+annotate = [
+    "micro-sam>=1.8.4",
+]
 dev = [
     "ruff>=0.15.9",
 ]

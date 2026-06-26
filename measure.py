@@ -640,6 +640,70 @@ def _grid_hole_zone(roi: np.ndarray, bar_px: int) -> np.ndarray:
     return cv2.dilate(hole, kernel).astype(bool)
 
 
+def _circularity(mask_bool: np.ndarray) -> float:
+    """Circularity (4*pi*area / perimeter^2) of a boolean mask via its contour."""
+    cnts, _ = cv2.findContours(
+        mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not cnts:
+        return 0.0
+    cnt = max(cnts, key=cv2.contourArea)
+    per = cv2.arcLength(cnt, True)
+    area = mask_bool.sum()
+    return float((4 * np.pi * area) / (per**2)) if per > 0 else 0.0
+
+
+def _measure_region(
+    roi: np.ndarray,
+    mask_bool: np.ndarray,
+    label: int,
+    nm_per_pixel: float,
+    circ: float | None = None,
+) -> dict | None:
+    """
+    Build the measurement row for a single particle mask (no rejection).
+
+    Shared by the automatic detector path (after its filters) and the
+    interactive annotator (where the human is the filter). Returns None for
+    an empty mask.
+    """
+    area = int(mask_bool.sum())
+    if area == 0:
+        return None
+    if circ is None:
+        circ = _circularity(mask_bool)
+    radius_px = float(np.sqrt(area / np.pi))
+    diam_nm = 2 * np.sqrt(area * nm_per_pixel**2 / np.pi)
+    ys, xs = np.nonzero(mask_bool)
+    cy, cx = int(ys.mean()), int(xs.mean())
+
+    wall_info = measure_wall_thickness(roi, cy, cx, radius_px, nm_per_pixel)
+    wall_nm = wall_info["wall_px"] * nm_per_pixel if wall_info["wall_px"] is not None else None
+
+    return {
+        "id": label,
+        "cx": cx,
+        "cy": cy,
+        "radius_px": round(radius_px, 1),
+        "diam_nm": round(diam_nm, 1),
+        "wall_nm": round(wall_nm, 1) if wall_nm is not None else None,
+        "circularity": round(circ, 3),
+        "is_vesicle": wall_info["is_vesicle"],
+        "_wall_info": wall_info,
+    }
+
+
+def measure_regions(roi: np.ndarray, masks: np.ndarray, nm_per_pixel: float) -> pd.DataFrame:
+    """Measure every labelled region with no rejection (for human-picked masks)."""
+    rows = []
+    for label in range(1, int(masks.max()) + 1):
+        mask_i = masks == label
+        row = _measure_region(roi, mask_i, label, nm_per_pixel)
+        if row is not None:
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def measure_particles(
     roi: np.ndarray,
     masks: np.ndarray,
@@ -675,25 +739,9 @@ def measure_particles(
         if contrast < MIN_CONTRAST:
             continue
 
-        cy, cx = int(p.centroid[0]), int(p.centroid[1])
-
-        wall_info = measure_wall_thickness(roi, cy, cx, radius_px, nm_per_pixel)
-
-        wall_nm = wall_info["wall_px"] * nm_per_pixel if wall_info["wall_px"] is not None else None
-
-        rows.append(
-            {
-                "id": p.label,
-                "cx": cx,
-                "cy": cy,
-                "radius_px": round(radius_px, 1),
-                "diam_nm": round(diam_nm, 1),
-                "wall_nm": round(wall_nm, 1) if wall_nm is not None else None,
-                "circularity": round(circ, 3),
-                "is_vesicle": wall_info["is_vesicle"],
-                "_wall_info": wall_info,
-            }
-        )
+        row = _measure_region(roi, mask_i, p.label, nm_per_pixel, circ=circ)
+        if row is not None:
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
