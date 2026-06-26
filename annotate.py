@@ -11,16 +11,24 @@ low-edge-contrast vesicles entirely. Prompted at a point it traces the
 boundary cleanly (validated on these images). The light-microscopy weights
 (vit_b_lm) match round vesicle-like blobs better than the EM-organelle ones.
 
+Works on a single image, several images, or a whole folder (recursing). The
+SAM model loads once and is reused across every image. Each saved image gets
+the same per-image outputs as the batch pipeline (detections.png,
+particles.csv, profiles) plus a combined output_annotated/all_particles.csv.
+
 Usage:
     uv run python annotate.py "images/AMOSTRA ANA/MP Ana_SA-MAG_X50k_026.bmp"
+    uv run python annotate.py images/                 # whole tree
+    uv run python annotate.py "images/AMOSTRA ANA/"   # one folder
     uv run python annotate.py IMAGE --scale-nm 100
 
 Controls (matplotlib window):
     left click   segment a particle at that point and add it
     right click  remove the particle under the cursor (or use 'u')
     u            undo last added particle
-    s            save measurements (CSV + detections.png + profiles)
-    q            quit (prompts nothing; save first with 's')
+    s            save this image's particles and advance to the next
+    n            skip this image (no particles) and advance
+    q            quit the whole session
 """
 
 import argparse
@@ -30,6 +38,7 @@ from pathlib import Path
 import cv2
 import matplotlib
 import numpy as np
+import pandas as pd
 
 import measure as m
 
@@ -71,21 +80,26 @@ def _resolve_scale(image_path: Path, img: np.ndarray, scale_nm: float | None):
     return scale_nm, bar_px
 
 
-class Annotator:
-    def __init__(self, image_path: Path, output_dir: Path, scale_nm, model, device):
+class ImageAnnotator:
+    """One interactive window for a single image, using a shared SAM predictor."""
+
+    def __init__(
+        self, image_path, image_label, subfolder, output_dir, predictor, scale_nm, progress
+    ):
         self.image_path = image_path
+        self.image_label = image_label
+        self.subfolder = subfolder
         self.output_dir = output_dir
+        self.predictor = predictor
+        self.progress = progress  # e.g. "3/19"
 
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise SystemExit(f"Could not load {image_path}")
+            raise ValueError(f"could not load {image_path}")
 
         bar_nm, bar_px = _resolve_scale(image_path, img, scale_nm)
         if bar_nm is None or bar_px is None or bar_nm <= 0 or bar_px <= 0:
-            raise SystemExit(
-                f"Could not determine scale for {image_path.name}. "
-                "Pass --scale-nm (and ensure a scale bar is visible)."
-            )
+            raise ValueError("could not determine scale (no readable scale bar)")
 
         h, w = img.shape
         self.sf = min(1.0, WORK_DIM / max(h, w))
@@ -95,33 +109,24 @@ class Annotator:
             )
         else:
             self.work = img
-        # nm per pixel at the work resolution
-        self.nm_per_pixel = bar_nm / (bar_px * self.sf)
+        self.nm_per_pixel = bar_nm / (bar_px * self.sf)  # at work resolution
         self.bar_nm = bar_nm
 
-        print(
-            f"  scale: {bar_nm:.0f} nm / {bar_px} px (full) -> "
-            f"{self.nm_per_pixel:.3f} nm/px at work res"
-        )
-        print(f"  loading SAM model '{model}' on {device} (first run downloads weights)...")
-        from micro_sam.util import get_sam_model
+        self.predictor.set_image(cv2.cvtColor(m.normalize_intensity(self.work), cv2.COLOR_GRAY2RGB))
 
-        self.predictor = get_sam_model(model_type=model, device=device)
-        norm = m.normalize_intensity(self.work)
-        self.predictor.set_image(cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB))
-        print("  ready. Click particles; press 's' to save, 'u' to undo, 'q' to quit.")
-
-        self.masks: list[np.ndarray] = []  # list of bool masks at work res
+        self.masks: list[np.ndarray] = []  # bool masks at work resolution
+        self.action: str | None = None  # 'save' | 'skip' | 'quit'
+        self.saved_df: pd.DataFrame | None = None
 
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.imshow(self.work, cmap="gray")
         self.overlay = None
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.fig.canvas.mpl_connect("close_event", self.on_close)
         self._redraw()
 
     def _labels(self) -> np.ndarray:
-        """Compose stored masks into a label image (later clicks drawn on top)."""
         labels = np.zeros(self.work.shape, dtype=np.int32)
         for i, mk in enumerate(self.masks, start=1):
             labels[mk] = i
@@ -140,8 +145,8 @@ class Annotator:
                 rgba[mk, 3] = 0.45
             self.overlay = self.ax.imshow(rgba)
         self.ax.set_title(
-            f"{self.image_path.name} — {len(self.masks)} particle(s)   "
-            "[click=add  right-click/u=undo  s=save  q=quit]"
+            f"[{self.progress}] {self.image_path.name} — {len(self.masks)} particle(s)\n"
+            "click=add  right-click/u=undo   s=save+next   n=skip   q=quit"
         )
         self.fig.canvas.draw_idle()
 
@@ -178,39 +183,54 @@ class Annotator:
                 self.masks.pop()
                 self._redraw()
         elif event.key == "s":
-            self.save()
+            self.action = "save"
+            self._save()
+            plt.close(self.fig)
+        elif event.key == "n":
+            self.action = "skip"
+            plt.close(self.fig)
         elif event.key == "q":
+            self.action = "quit"
+            self._save()
             plt.close(self.fig)
 
-    def save(self):
+    def on_close(self, event):
+        # Window closed via the OS button: treat as quit if no explicit action.
+        if self.action is None:
+            self.action = "quit"
+            self._save()
+
+    def _save(self):
         if not self.masks:
-            print("  nothing to save (no particles).")
             return
         labels = self._labels()
         df = m.measure_regions(self.work, labels, self.nm_per_pixel)
         if df.empty:
-            print("  no measurable particles.")
             return
 
-        img_dir = m.make_unique_dir(self.output_dir, self.image_path)
+        img_dir = m.make_unique_dir(self.output_dir, self.image_path, self.subfolder)
         cv2.imwrite(str(img_dir / "roi.png"), self.work)
         vis = m.draw_detections(self.work, labels, df, self.nm_per_pixel, self.bar_nm)
         cv2.imwrite(str(img_dir / "detections.png"), vis)
         m.save_profiles(df, img_dir, self.nm_per_pixel)
+
         export = df[[c for c in df.columns if not c.startswith("_")]].copy()
-        export.insert(0, "image", self.image_path.name)
+        export.to_csv(img_dir / "particles.csv", index=False)
+        export.insert(0, "image", self.image_label)
         export["nm_per_pixel"] = round(self.nm_per_pixel, 4)
         export["scale_bar_nm"] = self.bar_nm
-        export.to_csv(img_dir / "particles.csv", index=False)
+        self.saved_df = export
+
         print(f"  saved {len(df)} particle(s) -> {img_dir}")
         for _, r in df.iterrows():
             wall = f" wall={r['wall_nm']:.0f}nm" if r["wall_nm"] is not None else ""
-            print(f"    #{r['id']} d={r['diam_nm']:.0f}nm{wall}")
+            ves = "vesicle" if r["is_vesicle"] else "solid"
+            print(f"    #{r['id']} d={r['diam_nm']:.0f}nm{wall} [{ves}]")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Interactive SAM particle annotation")
-    ap.add_argument("image", help="TEM image to annotate")
+    ap.add_argument("images", nargs="+", help="Image file(s) or folder(s)")
     ap.add_argument(
         "--scale-nm", type=float, default=None, help="Scale bar value in nm (else auto)"
     )
@@ -221,16 +241,61 @@ def main():
     ap.add_argument("--device", default=None, help="cpu/mps/cuda (default auto)")
     args = ap.parse_args()
 
+    entries = m.collect_images(args.images)
+    if not entries:
+        print("No images found.")
+        sys.exit(1)
+
     device = args.device or _pick_device()
     output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True)
 
-    print(f"\n=== Interactive annotation: {Path(args.image).name} ===")
-    # Keep a reference so the figure's callbacks stay alive during plt.show().
-    _annotator = Annotator(Path(args.image), output_dir, args.scale_nm, args.model, device)
-    plt.show()
-    del _annotator
-    print("=== Done ===")
+    print(f"\n=== Interactive annotation: {len(entries)} image(s) ===")
+    print(f"  loading SAM model '{args.model}' on {device} (first run downloads weights)...")
+    from micro_sam.util import get_sam_model
+
+    predictor = get_sam_model(model_type=args.model, device=device)
+    print("  ready.\n  controls: click=add  right-click/u=undo  s=save+next  n=skip  q=quit\n")
+
+    results: list[pd.DataFrame] = []
+    for idx, (image_path, root_dir) in enumerate(entries, start=1):
+        image_label, subfolder = m.derive_labels(image_path, root_dir)
+        progress = f"{idx}/{len(entries)}"
+        print(f"[{progress}] {image_label}")
+        try:
+            ann = ImageAnnotator(
+                image_path, image_label, subfolder, output_dir, predictor, args.scale_nm, progress
+            )
+        except ValueError as e:
+            print(f"  SKIP: {e}")
+            continue
+
+        plt.show()  # blocks until this image's window is closed
+
+        if ann.saved_df is not None:
+            results.append(ann.saved_df)
+        if ann.action == "quit":
+            print("  quitting session.")
+            break
+
+    if results:
+        df_all = pd.concat(results, ignore_index=True)
+        agg = output_dir / "all_particles.csv"
+        df_all.to_csv(agg, index=False)
+        n, n_imgs = len(df_all), len(results)
+        print(f"\n--- Saved {n} particle(s) across {n_imgs} image(s) ---")
+        d = df_all["diam_nm"]
+        print(
+            f"  Diameter: {d.mean():.1f} +/- {d.std():.1f} nm"
+            if n > 1
+            else f"  Diameter: {d.mean():.1f} nm"
+        )
+        print(f"  Median:   {d.median():.1f} nm")
+        print(f"  Range:    {d.min():.1f} - {d.max():.1f} nm")
+        print(f"  Aggregate CSV: {agg}")
+    else:
+        print("\nNo particles saved.")
+    print("\n=== Done ===")
     sys.exit(0)
 
 
