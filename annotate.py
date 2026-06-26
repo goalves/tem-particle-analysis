@@ -29,12 +29,21 @@ from pathlib import Path
 
 import cv2
 import matplotlib
-
-matplotlib.use("QtAgg")  # interactive backend (PyQt5 ships with micro_sam's napari)
-import matplotlib.pyplot as plt
 import numpy as np
 
 import measure as m
+
+# measure.py selects the headless "Agg" backend on import. Override it *after*
+# that import with an interactive one so the annotation window can open. Try a
+# few in order: QtAgg (PyQt5 ships with micro_sam's napari), then the macOS
+# native backend, then Tk.
+for _backend in ("QtAgg", "macosx", "TkAgg"):
+    try:
+        matplotlib.use(_backend, force=True)
+        break
+    except Exception:
+        continue
+import matplotlib.pyplot as plt  # noqa: E402  (must follow the backend switch)
 
 # SAM works at 1024 internally; downsample large micrographs to this for the
 # embedding and prompting, then measurements are done at this work resolution.
