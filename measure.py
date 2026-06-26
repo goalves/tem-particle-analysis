@@ -30,6 +30,7 @@ import torch
 from cellpose.models import CellposeModel
 from scipy.ndimage import uniform_filter1d
 from skimage import measure
+from skimage.feature import blob_log
 
 # ---------------------------------------------------------------------------
 # Default configuration
@@ -51,7 +52,17 @@ EDGE_MARGIN_FRAC = 0.02
 # (heavy-metal staining + projection density). Reject detections where the
 # mean intensity inside the mask isn't at least this many uint8 units below
 # the mean intensity of an annular ring around it.
-MIN_CONTRAST = 10.0
+MIN_CONTRAST = 15.0
+
+# Grid-hole rejection. The support film has large bright holes (empty film /
+# grid openings); their dark rims are circular and high-contrast, so they get
+# detected as "particles." We find these holes explicitly (large connected
+# near-white regions), grow a zone around their rims, and reject any detection
+# landing in that zone. A real particle sits on gray film away from holes.
+GRID_HOLE_BRIGHTNESS = 220  # uint8 intensity above which a pixel is "empty film"
+GRID_HOLE_MIN_AREA_FRAC = 0.004  # a hole must be at least this fraction of the image
+GRID_HOLE_DILATE_VS_BAR = 0.4  # rim zone width as a fraction of the scale-bar px length
+GRID_HOLE_OVERLAP = 0.20  # reject if this fraction of a detection lies in the rim zone
 
 # Physical sanity check: the technician picks the magnification to match the
 # particle size, so real particles cluster within ~0.5-3x the scale bar.
@@ -59,6 +70,17 @@ MIN_CONTRAST = 10.0
 # (image features that aren't single particles) is rejected.
 MIN_DIAM_VS_BAR = 0.4
 MAX_DIAM_VS_BAR = 4.0
+
+# LoG blob detector tuning. `threshold` is the minimum LoG response: lower
+# values find fainter blobs at the cost of more spurious detections. The
+# detector runs on the inverted image so dark particles become bright blobs.
+LOG_NUM_SIGMA = 6
+LOG_THRESHOLD = 0.10
+LOG_OVERLAP = 0.5
+# Downsample large images before LoG; we map detections back to the original
+# resolution. LoG convolution cost grows with area*num_sigma, so this is the
+# main runtime lever. Particles span many pixels, so 1024 keeps them resolved.
+LOG_MAX_DIM = 1024
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
@@ -93,18 +115,29 @@ class ScaleBarLocation:
     y_bottom: int
 
 
-def detect_scale_bar(img: np.ndarray) -> ScaleBarLocation | None:
-    """
-    Auto-detect scale bar in the bottom of a TEM image.
+# A real scale bar spans only a small fraction of the image width. A detected
+# "bar" wider than this is almost always a full-width info footer or border,
+# not the bar itself.
+_MAX_BAR_WIDTH_FRAC = 0.4
 
-    Uses morphological filtering to find horizontal line structures.
-    Returns location (in full-image coordinates) or None if not found.
+
+def _find_horizontal_bar(img: np.ndarray, bright: bool) -> ScaleBarLocation | None:
+    """
+    Find the widest plausible horizontal bar in the bottom strip.
+
+    bright=False looks for dark bars (white-background / on-image bars);
+    bright=True looks for white bars (e.g. Gatan cryo-TEM, where the bar is a
+    white line inside a black info footer). Returns the widest component that
+    is bar-shaped (wide, thin) and not a full-width footer/border.
     """
     h, w = img.shape[:2]
     strip_y0 = int(h * 0.85)
     bottom = img[strip_y0:, :]
 
-    _, binary = cv2.threshold(bottom, 20, 255, cv2.THRESH_BINARY_INV)
+    if bright:
+        _, binary = cv2.threshold(bottom, 180, 255, cv2.THRESH_BINARY)
+    else:
+        _, binary = cv2.threshold(bottom, 20, 255, cv2.THRESH_BINARY_INV)
 
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
     horiz_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
@@ -115,7 +148,7 @@ def detect_scale_bar(img: np.ndarray) -> ScaleBarLocation | None:
     for i in range(1, n_labels):
         comp_w = int(stats[i, cv2.CC_STAT_WIDTH])
         comp_h = int(stats[i, cv2.CC_STAT_HEIGHT])
-        if comp_w <= w * 0.05 or comp_h >= h * 0.05:
+        if comp_w <= w * 0.05 or comp_w > w * _MAX_BAR_WIDTH_FRAC or comp_h >= h * 0.05:
             continue
         if best is not None and comp_w <= best.width_px:
             continue
@@ -130,6 +163,20 @@ def detect_scale_bar(img: np.ndarray) -> ScaleBarLocation | None:
         )
 
     return best
+
+
+def detect_scale_bar(img: np.ndarray) -> ScaleBarLocation | None:
+    """
+    Auto-detect scale bar in the bottom of a TEM image.
+
+    Tries dark bars first (covers ANA/ALE and on-image bars), then falls back
+    to bright bars for white-on-black info footers (Gatan cryo-TEM). Returns
+    location (in full-image coordinates) or None if not found.
+    """
+    bar = _find_horizontal_bar(img, bright=False)
+    if bar is None:
+        bar = _find_horizontal_bar(img, bright=True)
+    return bar
 
 
 _ocr_reader = None
@@ -400,6 +447,66 @@ def run_cellpose(roi: np.ndarray, diameter_px: float) -> np.ndarray:
     return masks
 
 
+def run_log_detector(roi: np.ndarray, nm_per_pixel: float, bar_nm: float) -> np.ndarray:
+    """
+    Laplacian-of-Gaussian blob detection sized by the scale bar.
+
+    Returns a label mask (0 = background, 1..N = particles) in the same
+    format as Cellpose's output, so the rest of the pipeline is unchanged.
+
+    Unlike Cellpose, LoG takes min/max blob radius as direct inputs — we
+    derive them from the scale bar so the detector only looks at scales the
+    technician was framing for. The image is inverted because LoG finds
+    bright blobs and TEM particles are dark.
+
+    Large images (e.g. 4096² cryo-TEM tifs) are downsampled before the
+    transform and detection coordinates are scaled back to full resolution;
+    LoG convolution time grows roughly with image area * num_sigma.
+    """
+    h, w = roi.shape
+    scale_factor = 1.0
+    if max(h, w) > LOG_MAX_DIM:
+        scale_factor = LOG_MAX_DIM / max(h, w)
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+        work = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        work_nm_per_px = nm_per_pixel / scale_factor
+    else:
+        work = roi
+        work_nm_per_px = nm_per_pixel
+
+    inverted = (255.0 - work.astype(np.float32)) / 255.0
+
+    min_radius_nm = (MIN_DIAM_VS_BAR * bar_nm) / 2.0
+    max_radius_nm = (MAX_DIAM_VS_BAR * bar_nm) / 2.0
+    min_sigma = max(1.0, min_radius_nm / work_nm_per_px / np.sqrt(2))
+    max_sigma = max(min_sigma + 1.0, max_radius_nm / work_nm_per_px / np.sqrt(2))
+
+    blobs = blob_log(
+        inverted,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        num_sigma=LOG_NUM_SIGMA,
+        threshold=LOG_THRESHOLD,
+        overlap=LOG_OVERLAP,
+    )
+
+    masks = np.zeros((h, w), dtype=np.int32)
+    if blobs.size == 0:
+        return masks
+
+    # Convert (y, x, sigma) → original-coordinate (y, x, radius_px). Draw
+    # largest first so smaller overlapping blobs overwrite (keeps the tight
+    # blob as the labelled region rather than the loose envelope).
+    blobs[:, :2] /= scale_factor
+    blobs[:, 2] = (blobs[:, 2] / scale_factor) * np.sqrt(2)
+    order = np.argsort(-blobs[:, 2])
+    for i, idx in enumerate(order, start=1):
+        y, x, r = blobs[idx]
+        cv2.circle(masks, (int(x), int(y)), int(r), int(i), thickness=-1)
+    return masks
+
+
 def compute_radial_profile(
     roi: np.ndarray, cy: int, cx: int, max_r: int, n_angles: int = 360
 ) -> np.ndarray:
@@ -489,12 +596,7 @@ def _is_near_edge(bbox: tuple[int, int, int, int], shape: tuple[int, int]) -> bo
     h, w = shape
     margin = int(min(h, w) * EDGE_MARGIN_FRAC)
     min_row, min_col, max_row, max_col = bbox
-    return (
-        min_row < margin
-        or min_col < margin
-        or max_row > h - margin
-        or max_col > w - margin
-    )
+    return min_row < margin or min_col < margin or max_row > h - margin or max_col > w - margin
 
 
 def _contrast_vs_ring(roi: np.ndarray, mask: np.ndarray, radius_px: float) -> float:
@@ -507,9 +609,7 @@ def _contrast_vs_ring(roi: np.ndarray, mask: np.ndarray, radius_px: float) -> fl
     background patch and not random distant pixels.
     """
     ring_width = max(3, int(radius_px * 0.5))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1)
-    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1))
     dilated = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
     ring = dilated & ~mask
     if not ring.any() or not mask.any():
@@ -517,14 +617,39 @@ def _contrast_vs_ring(roi: np.ndarray, mask: np.ndarray, radius_px: float) -> fl
     return float(roi[ring].mean() - roi[mask].mean())
 
 
+def _grid_hole_zone(roi: np.ndarray, bar_px: int) -> np.ndarray:
+    """
+    Boolean mask of the region on/around large bright support-film holes.
+
+    Detections landing here are almost always the dark rim of an empty-film
+    hole rather than a particle. We threshold near-white pixels, keep only
+    connected regions large enough to be actual holes (not bright specks),
+    then dilate by a scale-bar-relative margin so the rim band is covered.
+    """
+    bright = (roi > GRID_HOLE_BRIGHTNESS).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright)
+    min_area = roi.size * GRID_HOLE_MIN_AREA_FRAC
+    hole = np.zeros(roi.shape, dtype=np.uint8)
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            hole[labels == i] = 1
+    if not hole.any():
+        return hole.astype(bool)
+    margin = max(3, int(bar_px * GRID_HOLE_DILATE_VS_BAR))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
+    return cv2.dilate(hole, kernel).astype(bool)
+
+
 def measure_particles(
     roi: np.ndarray,
     masks: np.ndarray,
     nm_per_pixel: float,
     bar_nm: float,
+    bar_px: int,
 ) -> pd.DataFrame:
     min_diam_nm = MIN_DIAM_VS_BAR * bar_nm
     max_diam_nm = MAX_DIAM_VS_BAR * bar_nm
+    hole_zone = _grid_hole_zone(roi, bar_px)
 
     props = measure.regionprops(masks)
     rows = []
@@ -543,6 +668,9 @@ def measure_particles(
 
         radius_px = np.sqrt(p.area / np.pi)
         mask_i = masks == p.label
+        if hole_zone.any() and (mask_i & hole_zone).sum() > GRID_HOLE_OVERLAP * p.area:
+            continue
+
         contrast = _contrast_vs_ring(roi, mask_i, radius_px)
         if contrast < MIN_CONTRAST:
             continue
@@ -688,6 +816,7 @@ def process_image(
     scale_px: int | None,
     image_label: str,
     subfolder: str | None,
+    detector: str = "log",
 ) -> pd.DataFrame:
     """Process a single TEM image. Returns DataFrame of particle measurements."""
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -715,21 +844,21 @@ def process_image(
         print("  Provide --scale-nm and --scale-px, or ensure image has a visible scale bar.")
         return pd.DataFrame()
 
-    # The scale bar's pixel length is Cellpose's diameter hint (the model
-    # rescales internally to find features at that scale). We no longer
-    # impose a min/max diameter filter on the output — every Cellpose
-    # detection is accepted subject to shape, edge, and contrast checks.
-    diameter_px = float(bar_px)
-
     t0 = time.time()
-    masks = run_cellpose(img, diameter_px)
+    if detector == "cellpose":
+        # Scale-bar pixel length seeds Cellpose's internal rescaling.
+        masks = run_cellpose(img, float(bar_px))
+    elif detector == "log":
+        masks = run_log_detector(img, nm_per_pixel, bar_nm)
+    else:
+        raise ValueError(f"unknown detector: {detector!r}")
     elapsed = time.time() - t0
     raw_count = masks.max()
 
-    df = measure_particles(img, masks, nm_per_pixel, bar_nm)
+    df = measure_particles(img, masks, nm_per_pixel, bar_nm, bar_px)
     print(
         f"  {image_label}: {len(df)} particles ({raw_count} raw)"
-        f" [{elapsed:.1f}s] scale={nm_per_pixel:.3f} nm/px"
+        f" [{detector} {elapsed:.1f}s] scale={nm_per_pixel:.3f} nm/px"
         f" bar={bar_nm:.0f}nm/{bar_px}px"
     )
 
@@ -827,6 +956,12 @@ def main():
     parser.add_argument(
         "--output", type=str, default="output", help="Output directory (default: output)"
     )
+    parser.add_argument(
+        "--detector",
+        choices=["log", "cellpose"],
+        default="log",
+        help="Blob detector (default: log)",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -853,7 +988,13 @@ def main():
     for image_path, root_dir in image_entries:
         image_label, subfolder = derive_labels(image_path, root_dir)
         df = process_image(
-            image_path, output_dir, args.scale_nm, args.scale_px, image_label, subfolder
+            image_path,
+            output_dir,
+            args.scale_nm,
+            args.scale_px,
+            image_label,
+            subfolder,
+            args.detector,
         )
         if len(df) > 0:
             all_results.append(df)
