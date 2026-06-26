@@ -22,10 +22,18 @@ Usage:
     uv run python annotate.py "images/AMOSTRA ANA/"   # one folder
     uv run python annotate.py IMAGE --scale-nm 100
 
+Each particle is built from one or more prompts, then committed. A single
+click often grabs only a small sub-blob of a large faint particle; add more
+points (or press 'm' to take SAM's larger candidate) until the whole particle
+is highlighted, then commit it as one.
+
 Controls (matplotlib window):
-    left click   segment a particle at that point and add it
-    right click  remove the particle under the cursor (or use 'u')
-    u            undo last added particle
+    left click   add a positive point to the current particle (re-segments)
+    right click  add a negative point ("not this part") to the current one
+    m            cycle SAM's 3 mask scales (small part -> whole particle)
+    enter/space  commit the current particle as one, start the next
+    c            clear the current (in-progress) particle and restart it
+    u            undo the last committed particle
     s            save this image's particles and advance to the next
     n            skip this image (no particles) and advance
     q            quit the whole session
@@ -114,13 +122,22 @@ class ImageAnnotator:
 
         self.predictor.set_image(cv2.cvtColor(m.normalize_intensity(self.work), cv2.COLOR_GRAY2RGB))
 
-        self.masks: list[np.ndarray] = []  # bool masks at work resolution
+        self.committed: list[np.ndarray] = []  # finished particle masks (work res)
         self.action: str | None = None  # 'save' | 'skip' | 'quit'
         self.saved_df: pd.DataFrame | None = None
 
+        # In-progress particle being built from one or more prompts. SAM
+        # returns three candidate masks per prompt (small part -> whole
+        # object); cur_idx selects which, cycled with 'm'.
+        self.cur_points: list[tuple[int, int, int]] = []  # (x, y, label 1=pos/0=neg)
+        self.cur_masks: np.ndarray | None = None  # (3, H, W) candidates
+        self.cur_idx: int = 0
+
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.imshow(self.work, cmap="gray")
-        self.overlay = None
+        self.overlay = None  # committed particles overlay
+        self.preview = None  # current in-progress mask overlay
+        self.pts_artist = None  # current prompt point markers
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
         self.fig.canvas.mpl_connect("close_event", self.on_close)
@@ -128,62 +145,112 @@ class ImageAnnotator:
 
     def _labels(self) -> np.ndarray:
         labels = np.zeros(self.work.shape, dtype=np.int32)
-        for i, mk in enumerate(self.masks, start=1):
+        for i, mk in enumerate(self.committed, start=1):
             labels[mk] = i
         return labels
 
+    def _cur_mask(self) -> np.ndarray | None:
+        if self.cur_masks is None:
+            return None
+        return self.cur_masks[self.cur_idx].astype(bool)
+
+    def _predict_current(self):
+        """Re-run SAM for the in-progress particle from its accumulated points."""
+        if not self.cur_points:
+            self.cur_masks = None
+            return
+        coords = np.array([[x, y] for x, y, _ in self.cur_points])
+        labels = np.array([lab for _, _, lab in self.cur_points])
+        masks, scores, _ = self.predictor.predict(
+            point_coords=coords, point_labels=labels, multimask_output=True
+        )
+        self.cur_masks = masks
+        self.cur_idx = int(np.argmax(scores))
+
     def _redraw(self):
-        if self.overlay is not None:
-            self.overlay.remove()
-            self.overlay = None
-        if self.masks:
+        for artist in (self.overlay, self.preview, self.pts_artist):
+            if artist is not None:
+                artist.remove()
+        self.overlay = self.preview = self.pts_artist = None
+
+        if self.committed:
             rgba = np.zeros((*self.work.shape, 4), dtype=np.float32)
             rng = np.random.default_rng(0)
-            for mk in self.masks:
+            for mk in self.committed:
                 c = rng.random(3)
                 rgba[mk, :3] = c
                 rgba[mk, 3] = 0.45
             self.overlay = self.ax.imshow(rgba)
+
+        cur = self._cur_mask()
+        if cur is not None:
+            rgba = np.zeros((*self.work.shape, 4), dtype=np.float32)
+            rgba[cur] = (1.0, 1.0, 0.0, 0.45)  # bright yellow = in-progress
+            self.preview = self.ax.imshow(rgba)
+        if self.cur_points:
+            xs = [p[0] for p in self.cur_points]
+            ys = [p[1] for p in self.cur_points]
+            cs = ["lime" if p[2] == 1 else "red" for p in self.cur_points]
+            self.pts_artist = self.ax.scatter(xs, ys, c=cs, s=60, edgecolors="black", zorder=5)
+
+        diam = ""
+        if cur is not None:
+            d = 2 * np.sqrt(cur.sum() * self.nm_per_pixel**2 / np.pi)
+            diam = f"  current~{d:.0f}nm (m=rescale)"
         self.ax.set_title(
-            f"[{self.progress}] {self.image_path.name} — {len(self.masks)} particle(s)\n"
-            "click=add  right-click/u=undo   s=save+next   n=skip   q=quit"
+            f"[{self.progress}] {self.image_path.name} — "
+            f"{len(self.committed)} done{diam}\n"
+            "click=point  right-click=neg-point  m=rescale  enter=commit  "
+            "c=clear  u=undo  s=save+next  n=skip  q=quit"
         )
         self.fig.canvas.draw_idle()
+
+    def _commit_current(self):
+        cur = self._cur_mask()
+        if cur is None:
+            return
+        if cur.mean() > 0.5:  # whole-frame mask = background, drop it
+            print(f"  ignored: mask covers {cur.mean() * 100:.0f}% of image (background)")
+        else:
+            self.committed.append(cur)
+            print(f"  committed particle {len(self.committed)}")
+        self.cur_points = []
+        self.cur_masks = None
+        self.cur_idx = 0
 
     def on_click(self, event):
         if event.inaxes != self.ax or event.xdata is None:
             return
         x, y = round(event.xdata), round(event.ydata)
-        if event.button == 3:  # right click = remove particle under cursor
-            for i in range(len(self.masks) - 1, -1, -1):
-                if self.masks[i][y, x]:
-                    del self.masks[i]
-                    self._redraw()
-                    return
+        if event.button == 1:  # positive point on current particle
+            self.cur_points.append((x, y, 1))
+        elif event.button == 3:  # negative point on current particle
+            self.cur_points.append((x, y, 0))
+        else:
             return
-        if event.button != 1:
-            return
-        masks, scores, _ = self.predictor.predict(
-            point_coords=np.array([[x, y]]),
-            point_labels=np.array([1]),
-            multimask_output=True,
-        )
-        best = masks[int(np.argmax(scores))].astype(bool)
-        frac = best.mean()
-        if frac > 0.5:  # selected most of the frame — almost certainly background
-            print(f"  ignored click ({x},{y}): mask covers {frac * 100:.0f}% of image (background)")
-            return
-        self.masks.append(best)
-        print(f"  + particle {len(self.masks)} (score {scores.max():.2f})")
+        self._predict_current()
         self._redraw()
 
     def on_key(self, event):
-        if event.key == "u":
-            if self.masks:
-                self.masks.pop()
+        if event.key == "m":  # cycle SAM's 3 candidate scales for current
+            if self.cur_masks is not None:
+                self.cur_idx = (self.cur_idx + 1) % len(self.cur_masks)
+                self._redraw()
+        elif event.key in ("enter", " "):  # commit current particle, start next
+            self._commit_current()
+            self._redraw()
+        elif event.key == "c":  # clear in-progress particle
+            self.cur_points = []
+            self.cur_masks = None
+            self.cur_idx = 0
+            self._redraw()
+        elif event.key == "u":  # undo last committed particle
+            if self.committed:
+                self.committed.pop()
                 self._redraw()
         elif event.key == "s":
             self.action = "save"
+            self._commit_current()
             self._save()
             plt.close(self.fig)
         elif event.key == "n":
@@ -191,6 +258,7 @@ class ImageAnnotator:
             plt.close(self.fig)
         elif event.key == "q":
             self.action = "quit"
+            self._commit_current()
             self._save()
             plt.close(self.fig)
 
@@ -198,10 +266,11 @@ class ImageAnnotator:
         # Window closed via the OS button: treat as quit if no explicit action.
         if self.action is None:
             self.action = "quit"
+            self._commit_current()
             self._save()
 
     def _save(self):
-        if not self.masks:
+        if not self.committed:
             return
         labels = self._labels()
         df = m.measure_regions(self.work, labels, self.nm_per_pixel)
@@ -255,7 +324,11 @@ def main():
     from micro_sam.util import get_sam_model
 
     predictor = get_sam_model(model_type=args.model, device=device)
-    print("  ready.\n  controls: click=add  right-click/u=undo  s=save+next  n=skip  q=quit\n")
+    print(
+        "  ready.\n"
+        "  controls: click=point  right-click=neg  m=rescale  enter=commit particle\n"
+        "            c=clear  u=undo  s=save+next  n=skip  q=quit\n"
+    )
 
     results: list[pd.DataFrame] = []
     for idx, (image_path, root_dir) in enumerate(entries, start=1):
