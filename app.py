@@ -192,6 +192,19 @@ def handle_click(x, y, mode, work, state: c.ImageState):
     ss.cur_masks, ss.cur_idx = masks, best
 
 
+def undo_point(state: c.ImageState, work):
+    """Remove the last prompt point of the in-progress particle and re-segment."""
+    ss = st.session_state
+    if not ss.cur_points:
+        return
+    ss.cur_points.pop()
+    if ss.cur_points:
+        ensure_embedding(state.label, work)
+        ss.cur_masks, ss.cur_idx = c.sam_predict(get_predictor(), ss.cur_points)
+    else:
+        ss.cur_masks, ss.cur_idx = None, 0
+
+
 def commit_current(state: c.ImageState):
     cm = cur_mask()
     if cm is None:
@@ -320,14 +333,19 @@ def main():
 
     with right:
         ss.mode = st.radio("Click action", ["+ point", "- point", "remove"], horizontal=True)
-        b1, b2, b3 = st.columns(3)
+        npts = len(ss.cur_points)
+        st.caption(f"current particle: {npts} point(s)" if npts else "no particle in progress")
+        b1, b2, b3, b4 = st.columns(4)
         if b1.button("Commit", use_container_width=True):
             commit_current(state)
             st.rerun()
         if b2.button("Cycle scale", use_container_width=True) and ss.cur_masks is not None:
             ss.cur_idx = (ss.cur_idx + 1) % len(ss.cur_masks)
             st.rerun()
-        if b3.button("Clear", use_container_width=True):
+        if b3.button("Undo point", use_container_width=True):
+            undo_point(state, work)
+            st.rerun()
+        if b4.button("Clear", use_container_width=True):
             reset_drawing()
             st.rerun()
 
