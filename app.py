@@ -1,24 +1,26 @@
 """
 Particle measurement web app.
 
-One coherent application to measure particle sizes across a whole image corpus:
-auto-detect on load, correct by hand (add / remove / re-segment), fix the scale
-bar when OCR misreads, navigate the corpus, and export one CSV. All edits are
-persisted to annotations.json next to the images, so you can close, reopen,
-verify and re-measure any image later.
+One coherent application to measure particle sizes across an image corpus:
 
-Run:
-    uv run --group app streamlit run app.py
-then set the image folder in the sidebar (default: images/).
+- A file explorer (left) lists every image grouped by folder with a review
+  status: ○ unreviewed, ✓ reviewed, ⚑ flagged for re-review.
+- Opening an image is fast — nothing is computed until you ask. Run auto-detect
+  (LoG or Cellpose) when you want it, or add particles by hand with SAM.
+- Correct freely: add (SAM point-prompt), remove, re-segment, fix the scale bar.
+- Zoom and pan the image to click precisely.
+- Everything persists to annotations.json beside the images, so you can close,
+  reopen, verify and re-measure later.
 
-Click actions (radio in the sidebar):
-    + point   build a particle: click on it (add more clicks to grow it)
-    - point   exclude a region SAM wrongly grabbed
-    remove    click a particle to delete it
-Use "Commit particle" to finalise the one you're building; "Cycle scale" takes
-SAM's next mask size (small part -> whole object).
+Output:
+- measurements.csv : the corpus result, one row per particle (same columns as
+  the batch pipeline, plus a 'source' = auto|manual).
+- annotations.json : the resumable session (scale + particle polygons + status).
+
+Run:  uv run --group app streamlit run app.py     (or: just app)
 """
 
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -33,130 +35,147 @@ st.set_page_config(page_title="Particle measurement", layout="wide")
 
 AUTO_COLOR = (60, 220, 60)
 MANUAL_COLOR = (0, 200, 255)
-SELECTED_COLOR = (255, 60, 60)
+DISPLAY_W = 760  # width of the viewer in px
 
 
 # ---------------------------------------------------------------------------
 # Cached heavy resources
 # ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading SAM model...")
+@st.cache_resource(show_spinner="Loading SAM model (first time only)...")
 def get_predictor():
     import torch
     from micro_sam.util import get_sam_model
 
-    device = (
+    dev = (
         "mps"
         if torch.backends.mps.is_available()
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    return get_sam_model(model_type="vit_b_lm", device=device)
+    return get_sam_model(model_type="vit_b_lm", device=dev)
 
 
 @st.cache_data(show_spinner=False)
 def load_work_cached(path_str: str):
-    work, sf = c.load_work_image(Path(path_str))
-    return work, sf
+    return c.load_work_image(Path(path_str))
 
 
 # ---------------------------------------------------------------------------
 # Session bootstrap
 # ---------------------------------------------------------------------------
 def init_corpus(folder: str):
-    entries = m.collect_images([folder])
     ss = st.session_state
-    ss.entries = []  # list of (path, label)
-    for p, root in entries:
-        label, _ = m.derive_labels(p, root)
-        ss.entries.append((p, label))
+    ss.entries = [(p, m.derive_labels(p, root)[0]) for p, root in m.collect_images([folder])]
     ss.ann_path = Path(folder) / "annotations.json"
     ss.states = c.load_annotations(ss.ann_path)
     ss.idx = 0
+    ss.corpus_folder = folder
+    reset_view()
+    reset_drawing()
+    ss.embedded_label = None
+
+
+def reset_drawing():
+    ss = st.session_state
     ss.cur_points = []
     ss.cur_masks = None
     ss.cur_idx = 0
-    ss.selected = None
     ss.last_click = None
-    ss.embedded_label = None
-    ss.corpus_folder = folder
+
+
+def reset_view():
+    ss = st.session_state
+    ss.zoom = 1.0
+    ss.center = None  # set to image middle on first render
 
 
 def current_entry():
     return st.session_state.entries[st.session_state.idx]
 
 
-def get_state(path: Path, label: str, work, sf) -> c.ImageState:
-    """Fetch or create the ImageState for an image, auto-detecting on first open."""
+def go_to(idx: int):
     ss = st.session_state
-    if label in ss.states:
-        return ss.states[label]
-    nm, px = c.auto_scale(path)
-    state = c.ImageState(label=label, scale_nm=nm, scale_px=px, sf=sf)
+    ss.idx = idx
+    reset_view()
+    reset_drawing()
+
+
+def get_state(path: Path, label: str, sf: float) -> c.ImageState:
+    """Fetch or create the state. Does NOT run OCR or detection (fast open)."""
+    ss = st.session_state
+    if label not in ss.states:
+        ss.states[label] = c.ImageState(label=label, sf=sf)
+    return ss.states[label]
+
+
+def ensure_scale(state: c.ImageState, path: Path) -> bool:
+    """Resolve the scale on demand (OCR / TIFF metadata). Returns True if known."""
     if state.nm_per_pixel is not None:
-        with st.spinner("Auto-detecting particles..."):
-            state.particles = c.auto_detect(work, state)
-    ss.states[label] = state
+        return True
+    nm, px = c.auto_scale(path)
+    state.scale_nm, state.scale_px = nm, px
     persist()
-    return state
+    return state.nm_per_pixel is not None
 
 
 def persist():
-    ss = st.session_state
-    c.save_annotations(ss.ann_path, ss.states)
-
-
-def reset_current_drawing():
-    ss = st.session_state
-    ss.cur_points = []
-    ss.cur_masks = None
-    ss.cur_idx = 0
+    c.save_annotations(st.session_state.ann_path, st.session_state.states)
 
 
 def ensure_embedding(label: str, work):
     ss = st.session_state
     if ss.embedded_label != label:
-        predictor = get_predictor()
         rgb = cv2.cvtColor(m.normalize_intensity(work), cv2.COLOR_GRAY2RGB)
-        predictor.set_image(rgb)
+        get_predictor().set_image(rgb)
         ss.embedded_label = label
 
 
 def cur_mask():
     ss = st.session_state
-    if ss.cur_masks is None:
-        return None
-    return ss.cur_masks[ss.cur_idx]
+    return None if ss.cur_masks is None else ss.cur_masks[ss.cur_idx]
 
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Rendering (full-res overlays, then crop+resize for the zoom/pan view)
 # ---------------------------------------------------------------------------
-def render(work, state: c.ImageState) -> np.ndarray:
+def build_overlay(work, state: c.ImageState) -> np.ndarray:
     ss = st.session_state
     vis = cv2.cvtColor(work, cv2.COLOR_GRAY2RGB)
     for i, p in enumerate(state.particles):
         pts = np.array(p.contour, dtype=np.int32).reshape(-1, 1, 2)
-        color = (
-            SELECTED_COLOR
-            if ss.selected == i
-            else (MANUAL_COLOR if p.source == "manual" else AUTO_COLOR)
-        )
+        color = MANUAL_COLOR if p.source == "manual" else AUTO_COLOR
         cv2.polylines(vis, [pts], True, color, 2)
         cxy = pts.reshape(-1, 2).mean(axis=0).astype(int)
-        cv2.putText(vis, str(i + 1), tuple(cxy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(vis, str(i + 1), tuple(cxy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     cm = cur_mask()
     if cm is not None:
-        overlay = vis.copy()
-        overlay[cm] = (255, 255, 0)
-        vis = cv2.addWeighted(overlay, 0.4, vis, 0.6, 0)
+        ov = vis.copy()
+        ov[cm] = (255, 255, 0)
+        vis = cv2.addWeighted(ov, 0.4, vis, 0.6, 0)
         cnts, _ = cv2.findContours(cm.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(vis, cnts, -1, (255, 255, 0), 2)
     for x, y, lab in ss.cur_points:
-        cv2.circle(vis, (x, y), 5, (0, 255, 0) if lab == 1 else (255, 0, 0), -1)
+        cv2.circle(vis, (x, y), 6, (0, 255, 0) if lab == 1 else (255, 0, 0), -1)
     return vis
 
 
+def render_view(work, state: c.ImageState):
+    """Return (display_img, window, disp_w, disp_h) for the current zoom/pan."""
+    ss = st.session_state
+    h, w = work.shape
+    if ss.center is None:
+        ss.center = (w // 2, h // 2)
+    vis = build_overlay(work, state)
+    window = c.view_window(work.shape, ss.zoom, ss.center)
+    x0, y0, vw, vh = window
+    crop = vis[y0 : y0 + vh, x0 : x0 + vw]
+    disp_w = DISPLAY_W
+    disp_h = max(1, round(vh * disp_w / vw))
+    disp = cv2.resize(crop, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
+    return disp, window, disp_w, disp_h
+
+
 # ---------------------------------------------------------------------------
-# Click handling
+# Actions
 # ---------------------------------------------------------------------------
 def handle_click(x, y, mode, work, state: c.ImageState):
     ss = st.session_state
@@ -164,20 +183,13 @@ def handle_click(x, y, mode, work, state: c.ImageState):
         for i in range(len(state.particles) - 1, -1, -1):
             if state.particles[i].mask(work.shape)[y, x]:
                 del state.particles[i]
-                ss.selected = None
                 persist()
                 return
-        # nothing under click: select/deselect
-        ss.selected = None
         return
-    # + / - point: build current particle
-    label = 1 if mode == "+ point" else 0
-    ss.cur_points.append((x, y, label))
+    ss.cur_points.append((x, y, 1 if mode == "+ point" else 0))
     ensure_embedding(state.label, work)
-    predictor = get_predictor()
-    masks, best = c.sam_predict(predictor, ss.cur_points)
-    ss.cur_masks = masks
-    ss.cur_idx = best
+    masks, best = c.sam_predict(get_predictor(), ss.cur_points)
+    ss.cur_masks, ss.cur_idx = masks, best
 
 
 def commit_current(state: c.ImageState):
@@ -191,132 +203,190 @@ def commit_current(state: c.ImageState):
     if contour is not None:
         state.particles.append(c.Particle(contour=contour, source="manual"))
         persist()
-    reset_current_drawing()
+    reset_drawing()
+
+
+def run_auto_detect(work, state: c.ImageState, path: Path, detector: str):
+    if not ensure_scale(state, path):
+        st.warning("No scale for this image — set it in the Scale panel first.")
+        return
+    manual = [p for p in state.particles if p.source == "manual"]
+    with st.spinner(f"Detecting with {detector}..."):
+        state.particles = c.auto_detect(work, state, detector) + manual
+    state.detected = True
+    persist()
 
 
 # ---------------------------------------------------------------------------
-# UI
+# Sidebar: file explorer
 # ---------------------------------------------------------------------------
+def status_of(label: str) -> str:
+    st_ = st.session_state.states.get(label)
+    return st_.status if st_ else c.STATUS_UNREVIEWED
+
+
+def sidebar_explorer():
+    ss = st.session_state
+    st.title("Particle measurement")
+    folder = st.text_input("Image folder", value=ss.get("corpus_folder", "images"))
+    if st.button("Load / reload corpus") or "entries" not in ss:
+        init_corpus(folder)
+    if not ss.entries:
+        st.warning("No images found.")
+        st.stop()
+
+    # progress summary
+    statuses = [status_of(lbl) for _, lbl in ss.entries]
+    rev = statuses.count(c.STATUS_REVIEWED)
+    flg = statuses.count(c.STATUS_FLAGGED)
+    total = len(statuses)
+    st.caption(f"✓ {rev} reviewed · ⚑ {flg} flagged · ○ {total - rev - flg} to do · {total} total")
+
+    ss.detector = st.selectbox("Auto-detector", ["log", "cellpose"], index=0)
+
+    st.divider()
+    # grouped file tree
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, (_, label) in enumerate(ss.entries):
+        folder_name = label.split("/")[0] if "/" in label else "."
+        groups[folder_name].append(i)
+    for folder_name, idxs in groups.items():
+        n_rev = sum(status_of(ss.entries[i][1]) == c.STATUS_REVIEWED for i in idxs)
+        with st.expander(f"{folder_name}  ({n_rev}/{len(idxs)})", expanded=ss.idx in idxs):
+            for i in idxs:
+                label = ss.entries[i][1]
+                name = label.split("/")[-1]
+                icon = c.STATUS_ICON[status_of(label)]
+                marker = "➤ " if i == ss.idx else ""
+                if st.button(f"{marker}{icon} {name}", key=f"nav_{i}", use_container_width=True):
+                    go_to(i)
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def viewer_controls(work):
+    ss = st.session_state
+    h, w = work.shape
+    z1, z2, z3, z4, z5, z6 = st.columns(6)
+    ss.zoom = z1.slider("Zoom", 1.0, 8.0, ss.zoom, 0.5, label_visibility="collapsed")
+    _, _, vw, vh = c.view_window(work.shape, ss.zoom, ss.center)
+    step_x, step_y = int(vw * 0.3), int(vh * 0.3)
+    cx, cy = ss.center
+    if z2.button("⬅", use_container_width=True):
+        ss.center = (max(0, cx - step_x), cy)
+        ss.last_click = None
+    if z3.button("➡", use_container_width=True):
+        ss.center = (min(w, cx + step_x), cy)
+        ss.last_click = None
+    if z4.button("⬆", use_container_width=True):
+        ss.center = (cx, max(0, cy - step_y))
+        ss.last_click = None
+    if z5.button("⬇", use_container_width=True):
+        ss.center = (cx, min(h, cy + step_y))
+        ss.last_click = None
+    if z6.button("Reset", use_container_width=True):
+        reset_view()
+
+
 def main():
     ss = st.session_state
-
     with st.sidebar:
-        st.title("Particle measurement")
-        folder = st.text_input(
-            "Image folder", value=st.session_state.get("corpus_folder", "images")
-        )
-        if st.button("Load / reload corpus") or "entries" not in ss:
-            init_corpus(folder)
+        sidebar_explorer()
 
-        if not ss.entries:
-            st.warning("No images found in that folder.")
-            st.stop()
-
-        # Navigation
-        n = len(ss.entries)
-        col_a, col_b = st.columns(2)
-        if col_a.button("◀ Prev", use_container_width=True) and ss.idx > 0:
-            ss.idx -= 1
-            reset_current_drawing()
-            ss.selected = None
-        if col_b.button("Next ▶", use_container_width=True) and ss.idx < n - 1:
-            ss.idx += 1
-            reset_current_drawing()
-            ss.selected = None
-        labels = [lbl for _, lbl in ss.entries]
-        picked = st.selectbox("Image", labels, index=ss.idx)
-        if labels.index(picked) != ss.idx:
-            ss.idx = labels.index(picked)
-            reset_current_drawing()
-            ss.selected = None
-        st.caption(f"{ss.idx + 1} / {n}")
-
-        mode = st.radio("Click action", ["+ point", "- point", "remove"], horizontal=True)
-
-        c1, c2 = st.columns(2)
-        if c1.button("Commit particle", use_container_width=True):
-            commit_current(ss.states[current_entry()[1]])
-        if c2.button("Cycle scale (m)", use_container_width=True) and ss.cur_masks is not None:
-            ss.cur_idx = (ss.cur_idx + 1) % len(ss.cur_masks)
-        if st.button("Clear current drawing", use_container_width=True):
-            reset_current_drawing()
-
-    # ---- current image ----
     path, label = current_entry()
     work, sf = load_work_cached(str(path))
-    state = get_state(path, label, work, sf)
+    state = get_state(path, label, sf)
+
+    ss.setdefault("mode", "+ point")
+    if ss.get("center") is None:
+        ss.center = (work.shape[1] // 2, work.shape[0] // 2)
 
     left, right = st.columns([3, 2])
 
     with left:
-        st.subheader(label)
-        if state.nm_per_pixel is None:
-            st.error(
-                "No scale for this image — set the scale bar on the right to enable detection."
-            )
-        vis = render(work, state)
-        coords = streamlit_image_coordinates(vis, key=f"img_{ss.idx}")
-        if coords is not None:
-            click = (coords["x"], coords["y"])
-            if click != ss.last_click:
-                ss.last_click = click
-                x = int(np.clip(click[0], 0, work.shape[1] - 1))
-                y = int(np.clip(click[1], 0, work.shape[0] - 1))
-                handle_click(x, y, mode, work, state)
-                st.rerun()
+        st.markdown(f"**{label}**  ·  {c.STATUS_ICON[state.status]} {state.status}")
+        viewer_controls(work)
+        disp, window, disp_w, disp_h = render_view(work, state)
+        coords = streamlit_image_coordinates(disp, key=f"view_{ss.idx}")
+        if coords is not None and (coords["x"], coords["y"]) != ss.last_click:
+            ss.last_click = (coords["x"], coords["y"])
+            wx, wy = c.display_to_work(coords["x"], coords["y"], window, disp_w, disp_h)
+            wx = int(np.clip(wx, 0, work.shape[1] - 1))
+            wy = int(np.clip(wy, 0, work.shape[0] - 1))
+            handle_click(wx, wy, ss.mode, work, state)
+            st.rerun()
 
     with right:
-        # Scale-bar fix
+        ss.mode = st.radio("Click action", ["+ point", "- point", "remove"], horizontal=True)
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Commit", use_container_width=True):
+            commit_current(state)
+            st.rerun()
+        if b2.button("Cycle scale", use_container_width=True) and ss.cur_masks is not None:
+            ss.cur_idx = (ss.cur_idx + 1) % len(ss.cur_masks)
+            st.rerun()
+        if b3.button("Clear", use_container_width=True):
+            reset_drawing()
+            st.rerun()
+
+        if st.button(f"Run auto-detect ({ss.detector})", type="primary", use_container_width=True):
+            run_auto_detect(work, state, path, ss.detector)
+            st.rerun()
+
         with st.expander("Scale bar", expanded=state.nm_per_pixel is None):
+            if st.button("Auto-read scale (OCR / TIFF)"):
+                ensure_scale(state, path)
+                st.rerun()
             sc_nm = st.number_input(
                 "Scale value (nm)", value=float(state.scale_nm or 0.0), step=10.0
             )
             sc_px = st.number_input(
                 "Scale length (px, full-res)", value=int(state.scale_px or 0), step=1
             )
-            if st.button("Apply scale + re-detect"):
+            if st.button("Apply scale"):
                 state.scale_nm = sc_nm or None
                 state.scale_px = int(sc_px) or None
-                if state.nm_per_pixel is not None:
-                    # replace only auto particles; keep manual edits
-                    state.particles = [p for p in state.particles if p.source == "manual"]
-                    state.particles = c.auto_detect(work, state) + state.particles
                 persist()
                 st.rerun()
+            if state.nm_per_pixel:
+                st.caption(f"{state.nm_per_pixel:.3f} nm/px (work)")
 
-        if st.button("Re-run auto-detect (replace auto)") and state.nm_per_pixel is not None:
-            manual = [p for p in state.particles if p.source == "manual"]
-            state.particles = c.auto_detect(work, state) + manual
-            persist()
-            st.rerun()
-
-        # Measurements
+        # measurements
         df = c.measure_state(work, state)
         st.markdown(f"**{len(state.particles)} particle(s)**")
         if not df.empty:
-            show = df[["id", "diam_nm", "wall_nm", "circularity", "is_vesicle", "source"]]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(
+                df[["id", "diam_nm", "wall_nm", "circularity", "is_vesicle", "source"]],
+                use_container_width=True,
+                hide_index=True,
+            )
             st.caption(
                 f"median {df['diam_nm'].median():.0f} nm | "
                 f"range {df['diam_nm'].min():.0f}-{df['diam_nm'].max():.0f} nm"
             )
 
-        # Remove a specific particle by number
-        if state.particles:
-            rm = st.number_input(
-                "Remove particle #", min_value=0, max_value=len(state.particles), value=0
-            )
-            if rm and st.button(f"Delete particle {rm}"):
-                del state.particles[int(rm) - 1]
-                persist()
-                st.rerun()
+        # review status
+        s1, s2, s3 = st.columns(3)
+        if s1.button("✓ Reviewed", use_container_width=True):
+            state.status = c.STATUS_REVIEWED
+            persist()
+            st.rerun()
+        if s2.button("⚑ Flag", use_container_width=True):
+            state.status = c.STATUS_FLAGGED
+            persist()
+            st.rerun()
+        if s3.button("○ Clear", use_container_width=True):
+            state.status = c.STATUS_UNREVIEWED
+            persist()
+            st.rerun()
 
         st.divider()
-        if st.button("Export corpus CSV", type="primary"):
-            work_images = {}
-            for p, lbl in ss.entries:
-                if lbl in ss.states:
-                    work_images[lbl], _ = load_work_cached(str(p))
+        if st.button("Export corpus CSV", use_container_width=True):
+            work_images = {
+                lbl: load_work_cached(str(p))[0] for p, lbl in ss.entries if lbl in ss.states
+            }
             out = Path(ss.corpus_folder) / "measurements.csv"
             df_all = c.export_csv(out, work_images, ss.states)
             n_imgs = df_all["image"].nunique() if len(df_all) else 0

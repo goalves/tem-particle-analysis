@@ -74,6 +74,13 @@ class Particle:
         return m_.astype(bool)
 
 
+# Review lifecycle for the file explorer.
+STATUS_UNREVIEWED = "unreviewed"
+STATUS_REVIEWED = "reviewed"
+STATUS_FLAGGED = "flagged"  # marked for re-review
+STATUS_ICON = {STATUS_UNREVIEWED: "○", STATUS_REVIEWED: "✓", STATUS_FLAGGED: "⚑"}
+
+
 @dataclass
 class ImageState:
     label: str  # display/CSV label, e.g. "AMOSTRA ANA/x.bmp"
@@ -81,7 +88,8 @@ class ImageState:
     scale_px: int | None = None  # full-res scale bar pixel length
     sf: float = 1.0  # work/full resolution ratio
     particles: list[Particle] = field(default_factory=list)
-    reviewed: bool = False
+    status: str = STATUS_UNREVIEWED
+    detected: bool = False  # whether auto-detect has been run at least once
 
     @property
     def nm_per_pixel(self) -> float | None:
@@ -103,16 +111,25 @@ def mask_to_contour(mask: np.ndarray) -> list[list[int]] | None:
 # ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
-def auto_detect(work: np.ndarray, state: ImageState) -> list[Particle]:
-    """Run the LoG detector + filters on the work image; return particle polygons."""
+def auto_detect(work: np.ndarray, state: ImageState, detector: str = "log") -> list[Particle]:
+    """
+    Run an automatic detector + filters on the work image; return polygons.
+
+    detector="log" (default) is best for faint blobs; detector="cellpose" is
+    kept as a second option that occasionally does better on clustered or
+    well-defined particles.
+    """
     nmpp = state.nm_per_pixel
     if nmpp is None:
         return []
-    # run_log_detector/measure_particles operate in the given image's own
-    # pixel space, so passing the work image with work-res nm/px and a work-res
-    # scale-bar length keeps the size-vs-bar filter consistent.
+    # Detectors/filters operate in the given image's own pixel space, so the
+    # work image with work-res nm/px and a work-res scale-bar length keeps the
+    # size-vs-bar filter consistent.
     bar_px_work = max(1, round(state.scale_px * state.sf))
-    masks = m.run_log_detector(work, nmpp, state.scale_nm)
+    if detector == "cellpose":
+        masks = m.run_cellpose(work, float(bar_px_work))
+    else:
+        masks = m.run_log_detector(work, nmpp, state.scale_nm)
     df = m.measure_particles(work, masks, nmpp, state.scale_nm, bar_px_work)
     particles = []
     for _, row in df.iterrows():
@@ -173,13 +190,18 @@ def load_annotations(path: Path) -> dict[str, ImageState]:
     states: dict[str, ImageState] = {}
     for key, d in raw.items():
         parts = [Particle(**p) for p in d.get("particles", [])]
+        # back-compat: older files used a bool "reviewed"
+        status = d.get("status")
+        if status is None:
+            status = STATUS_REVIEWED if d.get("reviewed") else STATUS_UNREVIEWED
         states[key] = ImageState(
             label=d["label"],
             scale_nm=d.get("scale_nm"),
             scale_px=d.get("scale_px"),
             sf=d.get("sf", 1.0),
             particles=parts,
-            reviewed=d.get("reviewed", False),
+            status=status,
+            detected=d.get("detected", bool(parts)),
         )
     return states
 
@@ -207,3 +229,35 @@ def export_csv(
     df_all = pd.concat(frames, ignore_index=True)
     df_all.to_csv(path, index=False)
     return df_all
+
+
+# ---------------------------------------------------------------------------
+# Zoom / pan viewport (pure geometry, unit-testable)
+# ---------------------------------------------------------------------------
+def view_window(
+    shape: tuple[int, int], zoom: float, center: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """
+    Crop window (x0, y0, vw, vh) of the work image for a given zoom and center.
+
+    zoom=1 shows the whole image; higher zoom shows a smaller window. The window
+    is clamped to stay inside the image.
+    """
+    h, w = shape
+    zoom = max(1.0, float(zoom))
+    vw = max(1, round(w / zoom))
+    vh = max(1, round(h / zoom))
+    cx, cy = center
+    x0 = int(np.clip(cx - vw // 2, 0, max(0, w - vw)))
+    y0 = int(np.clip(cy - vh // 2, 0, max(0, h - vh)))
+    return x0, y0, vw, vh
+
+
+def display_to_work(
+    dx: float, dy: float, window: tuple[int, int, int, int], disp_w: int, disp_h: int
+) -> tuple[int, int]:
+    """Map a click on the displayed (cropped+resized) image back to work coords."""
+    x0, y0, vw, vh = window
+    wx = x0 + dx * (vw / disp_w)
+    wy = y0 + dy * (vh / disp_h)
+    return round(wx), round(wy)
