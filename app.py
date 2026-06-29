@@ -384,6 +384,18 @@ def main():
                 f"median {df['diam_nm'].median():.0f} nm | "
                 f"range {df['diam_nm'].min():.0f}-{df['diam_nm'].max():.0f} nm"
             )
+            # delete a listed particle by its # (matches the 'id' column / overlay label)
+            d1, d2 = st.columns([3, 2])
+            del_id = d1.selectbox("Delete particle #", list(df["id"]), key="del_id")
+            if d2.button("Delete", use_container_width=True):
+                # measure_state numbers particles 1..N in list order, so id-1 is the index
+                del state.particles[int(del_id) - 1]
+                persist()
+                st.rerun()
+            if st.button("Delete ALL particles on this image"):
+                state.particles = []
+                persist()
+                st.rerun()
 
         # review status
         s1, s2, s3 = st.columns(3)
