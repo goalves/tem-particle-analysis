@@ -19,6 +19,11 @@ dependencies = [
 annotate = [
     "micro-sam>=1.8.4",
 ]
+app = [
+    "micro-sam>=1.8.4",
+    "streamlit>=1.58.0",
+    "streamlit-image-coordinates>=0.4.0",
+]
 dev = [
     "ruff>=0.15.9",
 ]

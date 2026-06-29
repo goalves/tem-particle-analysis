@@ -16,6 +16,10 @@ batch DIR:
 annotate IMAGE:
     uv run --group annotate python annotate.py "{{ IMAGE }}"
 
+# Launch the measurement web app (auto-detect + correct + measure + export)
+app:
+    uv run --group app streamlit run app.py
+
 # Format code
 fmt:
     uv run ruff format measure.py

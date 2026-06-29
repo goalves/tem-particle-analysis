@@ -17,3 +17,7 @@ output/
 output_annotated/
 output_test/
 output_rt/
+
+images/annotations.json
+images/measurements.csv
+**/annotations.json
