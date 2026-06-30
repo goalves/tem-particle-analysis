@@ -428,7 +428,13 @@ def get_cellpose_model() -> CellposeModel:
     return _cellpose_model
 
 
-def run_cellpose(roi: np.ndarray, diameter_px: float) -> np.ndarray:
+def run_cellpose(
+    roi: np.ndarray,
+    diameter_px: float,
+    *,
+    flow_threshold: float = CELLPOSE_FLOW,
+    cellprob_threshold: float = CELLPOSE_CELLPROB,
+) -> np.ndarray:
     """
     Cellpose with an explicit diameter hint (the scale-bar pixel length).
 
@@ -441,13 +447,23 @@ def run_cellpose(roi: np.ndarray, diameter_px: float) -> np.ndarray:
         roi,
         diameter=diameter_px,
         channels=[0, 0],
-        flow_threshold=CELLPOSE_FLOW,
-        cellprob_threshold=CELLPOSE_CELLPROB,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
     )
     return masks
 
 
-def run_log_detector(roi: np.ndarray, nm_per_pixel: float, bar_nm: float) -> np.ndarray:
+def run_log_detector(
+    roi: np.ndarray,
+    nm_per_pixel: float,
+    bar_nm: float,
+    *,
+    threshold: float = LOG_THRESHOLD,
+    num_sigma: int = LOG_NUM_SIGMA,
+    overlap: float = LOG_OVERLAP,
+    min_diam_vs_bar: float = MIN_DIAM_VS_BAR,
+    max_diam_vs_bar: float = MAX_DIAM_VS_BAR,
+) -> np.ndarray:
     """
     Laplacian-of-Gaussian blob detection sized by the scale bar.
 
@@ -477,8 +493,8 @@ def run_log_detector(roi: np.ndarray, nm_per_pixel: float, bar_nm: float) -> np.
 
     inverted = (255.0 - work.astype(np.float32)) / 255.0
 
-    min_radius_nm = (MIN_DIAM_VS_BAR * bar_nm) / 2.0
-    max_radius_nm = (MAX_DIAM_VS_BAR * bar_nm) / 2.0
+    min_radius_nm = (min_diam_vs_bar * bar_nm) / 2.0
+    max_radius_nm = (max_diam_vs_bar * bar_nm) / 2.0
     min_sigma = max(1.0, min_radius_nm / work_nm_per_px / np.sqrt(2))
     max_sigma = max(min_sigma + 1.0, max_radius_nm / work_nm_per_px / np.sqrt(2))
 
@@ -486,9 +502,9 @@ def run_log_detector(roi: np.ndarray, nm_per_pixel: float, bar_nm: float) -> np.
         inverted,
         min_sigma=min_sigma,
         max_sigma=max_sigma,
-        num_sigma=LOG_NUM_SIGMA,
-        threshold=LOG_THRESHOLD,
-        overlap=LOG_OVERLAP,
+        num_sigma=num_sigma,
+        threshold=threshold,
+        overlap=overlap,
     )
 
     masks = np.zeros((h, w), dtype=np.int32)
@@ -591,10 +607,12 @@ def measure_wall_thickness(
     }
 
 
-def _is_near_edge(bbox: tuple[int, int, int, int], shape: tuple[int, int]) -> bool:
-    """True if a region's bounding box reaches into the EDGE_MARGIN_FRAC margin."""
+def _is_near_edge(
+    bbox: tuple[int, int, int, int], shape: tuple[int, int], margin_frac: float = EDGE_MARGIN_FRAC
+) -> bool:
+    """True if a region's bounding box reaches into the margin near any edge."""
     h, w = shape
-    margin = int(min(h, w) * EDGE_MARGIN_FRAC)
+    margin = int(min(h, w) * margin_frac)
     min_row, min_col, max_row, max_col = bbox
     return min_row < margin or min_col < margin or max_row > h - margin or max_col > w - margin
 
@@ -710,19 +728,31 @@ def measure_particles(
     nm_per_pixel: float,
     bar_nm: float,
     bar_px: int,
+    *,
+    min_circularity: float = MIN_CIRCULARITY,
+    min_contrast: float = MIN_CONTRAST,
+    min_diam_vs_bar: float = MIN_DIAM_VS_BAR,
+    max_diam_vs_bar: float = MAX_DIAM_VS_BAR,
+    edge_margin_frac: float = EDGE_MARGIN_FRAC,
+    reject_grid_holes: bool = True,
 ) -> pd.DataFrame:
-    min_diam_nm = MIN_DIAM_VS_BAR * bar_nm
-    max_diam_nm = MAX_DIAM_VS_BAR * bar_nm
-    hole_zone = _grid_hole_zone(roi, bar_px)
+    """
+    Filter raw detections and measure survivors. Each filter is parameterised so
+    callers (the app) can relax or disable it: a 0 threshold / 0 margin disables
+    that check, and reject_grid_holes=False turns off hole rejection.
+    """
+    min_diam_nm = min_diam_vs_bar * bar_nm
+    max_diam_nm = max_diam_vs_bar * bar_nm
+    hole_zone = _grid_hole_zone(roi, bar_px) if reject_grid_holes else None
 
     props = measure.regionprops(masks)
     rows = []
     for p in props:
-        if _is_near_edge(p.bbox, roi.shape):
+        if edge_margin_frac > 0 and _is_near_edge(p.bbox, roi.shape, edge_margin_frac):
             continue
 
         circ = (4 * np.pi * p.area) / (p.perimeter**2) if p.perimeter > 0 else 0
-        if circ < MIN_CIRCULARITY:
+        if circ < min_circularity:
             continue
 
         area_nm2 = p.area * nm_per_pixel**2
@@ -732,12 +762,17 @@ def measure_particles(
 
         radius_px = np.sqrt(p.area / np.pi)
         mask_i = masks == p.label
-        if hole_zone.any() and (mask_i & hole_zone).sum() > GRID_HOLE_OVERLAP * p.area:
+        if (
+            hole_zone is not None
+            and hole_zone.any()
+            and (mask_i & hole_zone).sum() > GRID_HOLE_OVERLAP * p.area
+        ):
             continue
 
-        contrast = _contrast_vs_ring(roi, mask_i, radius_px)
-        if contrast < MIN_CONTRAST:
-            continue
+        if min_contrast > 0:
+            contrast = _contrast_vs_ring(roi, mask_i, radius_px)
+            if contrast < min_contrast:
+                continue
 
         row = _measure_region(roi, mask_i, p.label, nm_per_pixel, circ=circ)
         if row is not None:

@@ -219,15 +219,75 @@ def commit_current(state: c.ImageState):
     reset_drawing()
 
 
-def run_auto_detect(work, state: c.ImageState, path: Path, detector: str):
+def run_auto_detect(work, state: c.ImageState, path: Path, params: c.DetectParams):
     if not ensure_scale(state, path):
         st.warning("No scale for this image — set it in the Scale panel first.")
         return
     manual = [p for p in state.particles if p.source == "manual"]
-    with st.spinner(f"Detecting with {detector}..."):
-        state.particles = c.auto_detect(work, state, detector) + manual
+    with st.spinner(f"Detecting with {params.detector}..."):
+        state.particles = c.auto_detect(work, state, params) + manual
     state.detected = True
     persist()
+
+
+def detection_settings_ui() -> c.DetectParams:
+    """Expose every detector knob + filter; returns the chosen DetectParams."""
+    d = c.DetectParams()  # defaults
+    with st.expander("Detection settings", expanded=False):
+        detector = st.selectbox("Detector", ["log", "cellpose"], key="p_detector")
+        if detector == "log":
+            log_threshold = st.slider(
+                "LoG threshold (lower = more, noisier)",
+                0.0,
+                0.5,
+                d.log_threshold,
+                0.01,
+                key="p_log_thr",
+            )
+            log_num_sigma = st.slider("LoG num_sigma", 3, 12, d.log_num_sigma, key="p_log_ns")
+            log_overlap = st.slider("LoG overlap", 0.0, 1.0, d.log_overlap, 0.05, key="p_log_ov")
+            cp_flow, cp_cellprob = d.cp_flow, d.cp_cellprob
+        else:
+            cp_flow = st.slider(
+                "Cellpose flow_threshold", 0.0, 3.0, d.cp_flow, 0.1, key="p_cp_flow"
+            )
+            cp_cellprob = st.slider(
+                "Cellpose cellprob_threshold (lower = more)",
+                -6.0,
+                6.0,
+                d.cp_cellprob,
+                0.5,
+                key="p_cp_cp",
+            )
+            log_threshold, log_num_sigma, log_overlap = (
+                d.log_threshold,
+                d.log_num_sigma,
+                d.log_overlap,
+            )
+
+        st.markdown("**Filters** — set to 0 / off to disable")
+        col1, col2 = st.columns(2)
+        min_diam = col1.slider("min diam ÷ bar", 0.0, 2.0, d.min_diam_vs_bar, 0.05, key="p_mind")
+        max_diam = col2.slider("max diam ÷ bar", 1.0, 8.0, d.max_diam_vs_bar, 0.5, key="p_maxd")
+        min_circ = col1.slider("min circularity", 0.0, 1.0, d.min_circularity, 0.05, key="p_circ")
+        min_contrast = col2.slider("min contrast", 0.0, 60.0, d.min_contrast, 1.0, key="p_con")
+        edge = col1.slider("edge margin frac", 0.0, 0.1, d.edge_margin_frac, 0.005, key="p_edge")
+        grid = col2.checkbox("reject grid holes", d.reject_grid_holes, key="p_grid")
+
+    return c.DetectParams(
+        detector=detector,
+        log_threshold=log_threshold,
+        log_num_sigma=log_num_sigma,
+        log_overlap=log_overlap,
+        cp_flow=cp_flow,
+        cp_cellprob=cp_cellprob,
+        min_diam_vs_bar=min_diam,
+        max_diam_vs_bar=max_diam,
+        min_circularity=min_circ,
+        min_contrast=min_contrast,
+        edge_margin_frac=edge,
+        reject_grid_holes=grid,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +314,6 @@ def sidebar_explorer():
     flg = statuses.count(c.STATUS_FLAGGED)
     total = len(statuses)
     st.caption(f"✓ {rev} reviewed · ⚑ {flg} flagged · ○ {total - rev - flg} to do · {total} total")
-
-    ss.detector = st.selectbox("Auto-detector", ["log", "cellpose"], index=0)
 
     st.divider()
     # grouped file tree
@@ -349,8 +407,11 @@ def main():
             reset_drawing()
             st.rerun()
 
-        if st.button(f"Run auto-detect ({ss.detector})", type="primary", use_container_width=True):
-            run_auto_detect(work, state, path, ss.detector)
+        params = detection_settings_ui()
+        if st.button(
+            f"Run auto-detect ({params.detector})", type="primary", use_container_width=True
+        ):
+            run_auto_detect(work, state, path, params)
             st.rerun()
 
         with st.expander("Scale bar", expanded=state.nm_per_pixel is None):

@@ -111,14 +111,38 @@ def mask_to_contour(mask: np.ndarray) -> list[list[int]] | None:
 # ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
-def auto_detect(work: np.ndarray, state: ImageState, detector: str = "log") -> list[Particle]:
+@dataclass
+class DetectParams:
+    """User-tunable detector + filter settings (defaults mirror measure.py)."""
+
+    detector: str = "log"
+    # LoG
+    log_threshold: float = m.LOG_THRESHOLD
+    log_num_sigma: int = m.LOG_NUM_SIGMA
+    log_overlap: float = m.LOG_OVERLAP
+    # Cellpose
+    cp_flow: float = m.CELLPOSE_FLOW
+    cp_cellprob: float = m.CELLPOSE_CELLPROB
+    # filters (a 0 / False disables that filter)
+    min_diam_vs_bar: float = m.MIN_DIAM_VS_BAR
+    max_diam_vs_bar: float = m.MAX_DIAM_VS_BAR
+    min_circularity: float = m.MIN_CIRCULARITY
+    min_contrast: float = m.MIN_CONTRAST
+    edge_margin_frac: float = m.EDGE_MARGIN_FRAC
+    reject_grid_holes: bool = True
+
+
+def auto_detect(
+    work: np.ndarray, state: ImageState, params: DetectParams | None = None
+) -> list[Particle]:
     """
     Run an automatic detector + filters on the work image; return polygons.
 
     detector="log" (default) is best for faint blobs; detector="cellpose" is
     kept as a second option that occasionally does better on clustered or
-    well-defined particles.
+    well-defined particles. All detector knobs and filters come from `params`.
     """
+    params = params or DetectParams()
     nmpp = state.nm_per_pixel
     if nmpp is None:
         return []
@@ -126,11 +150,37 @@ def auto_detect(work: np.ndarray, state: ImageState, detector: str = "log") -> l
     # work image with work-res nm/px and a work-res scale-bar length keeps the
     # size-vs-bar filter consistent.
     bar_px_work = max(1, round(state.scale_px * state.sf))
-    if detector == "cellpose":
-        masks = m.run_cellpose(work, float(bar_px_work))
+    if params.detector == "cellpose":
+        masks = m.run_cellpose(
+            work,
+            float(bar_px_work),
+            flow_threshold=params.cp_flow,
+            cellprob_threshold=params.cp_cellprob,
+        )
     else:
-        masks = m.run_log_detector(work, nmpp, state.scale_nm)
-    df = m.measure_particles(work, masks, nmpp, state.scale_nm, bar_px_work)
+        masks = m.run_log_detector(
+            work,
+            nmpp,
+            state.scale_nm,
+            threshold=params.log_threshold,
+            num_sigma=params.log_num_sigma,
+            overlap=params.log_overlap,
+            min_diam_vs_bar=params.min_diam_vs_bar,
+            max_diam_vs_bar=params.max_diam_vs_bar,
+        )
+    df = m.measure_particles(
+        work,
+        masks,
+        nmpp,
+        state.scale_nm,
+        bar_px_work,
+        min_circularity=params.min_circularity,
+        min_contrast=params.min_contrast,
+        min_diam_vs_bar=params.min_diam_vs_bar,
+        max_diam_vs_bar=params.max_diam_vs_bar,
+        edge_margin_frac=params.edge_margin_frac,
+        reject_grid_holes=params.reject_grid_holes,
+    )
     particles = []
     for _, row in df.iterrows():
         mask = masks == row["id"]
