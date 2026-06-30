@@ -71,15 +71,24 @@ def init_corpus(folder: str):
     ss.corpus_folder = folder
     reset_view()
     reset_drawing()
+    reset_click()
     ss.embedded_label = None
 
 
 def reset_drawing():
+    # NB: do NOT clear last_click here. The image-coordinates component keeps
+    # returning the last click across reruns; nulling last_click would make the
+    # next rerun (after commit/clear/undo) re-fire that stale click as a new
+    # point. last_click is only reset on image change, where the component key
+    # changes and returns None fresh (reset_click()).
     ss = st.session_state
     ss.cur_points = []
     ss.cur_masks = None
     ss.cur_idx = 0
-    ss.last_click = None
+
+
+def reset_click():
+    st.session_state.last_click = None
 
 
 def reset_view():
@@ -97,6 +106,7 @@ def go_to(idx: int):
     ss.idx = idx
     reset_view()
     reset_drawing()
+    reset_click()  # new image -> new component key, safe to clear
 
 
 def get_state(path: Path, label: str, sf: float) -> c.ImageState:
@@ -345,18 +355,16 @@ def viewer_controls(work):
     _, _, vw, vh = c.view_window(work.shape, ss.zoom, ss.center)
     step_x, step_y = int(vw * 0.3), int(vh * 0.3)
     cx, cy = ss.center
+    # NB: panning must NOT clear last_click — the component still holds the
+    # previous click and would re-fire it as a stray point at the remapped spot.
     if z2.button("⬅", use_container_width=True):
         ss.center = (max(0, cx - step_x), cy)
-        ss.last_click = None
     if z3.button("➡", use_container_width=True):
         ss.center = (min(w, cx + step_x), cy)
-        ss.last_click = None
     if z4.button("⬆", use_container_width=True):
         ss.center = (cx, max(0, cy - step_y))
-        ss.last_click = None
     if z5.button("⬇", use_container_width=True):
         ss.center = (cx, min(h, cy + step_y))
-        ss.last_click = None
     if z6.button("Reset", use_container_width=True):
         reset_view()
 
@@ -371,6 +379,7 @@ def main():
     state = get_state(path, label, sf)
 
     ss.setdefault("mode", "+ point")
+    ss.setdefault("last_click", None)
     if ss.get("center") is None:
         ss.center = (work.shape[1] // 2, work.shape[0] // 2)
 
